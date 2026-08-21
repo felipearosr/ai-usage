@@ -1,0 +1,21 @@
+[package]
+name = "aiu"
+version = "0.1.0"
+edition = "2021"
+description = "AI coding subscription usage tracker (Claude Code, Codex, OpenCode Go)"
+license = "MIT"
+
+[[bin]]
+name = "aiu"
+path = "src/main.rs"
+
+[dependencies]
+# SQLite storage is mandated by the spec; bundled so we do not depend on a
+# system libsqlite across Linux/macOS targets.
+rusqlite = { version = "0.40", features = ["bundled"] }
+# `--json` output on report commands is mandated by the spec.
+serde_json = "1"
+
+[profile.release]
+strip = true
+lto = true
