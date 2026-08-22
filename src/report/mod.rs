@@ -5,6 +5,7 @@
 //! feeds normalized events/snapshots into an in-memory store and asserts on
 //! what comes out here.
 
+pub mod detail;
 pub mod json;
 pub mod text;
 
@@ -130,34 +131,7 @@ pub fn build(store: &Store, now_epoch: u64) -> crate::error::Result<Report> {
 }
 
 fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Result<SourceReport> {
-    // SQLite's bare-column-with-MAX rule guarantees used_percent/resets come
-    // from the most recently observed snapshot per window.
-    let windows = {
-        let mut stmt = conn.prepare(
-            // Deterministic latest observation per window: newest observed_at,
-            // highest row id breaking ties between same-second snapshots.
-            "SELECT q.window, q.used_percent, q.resets_at_utc
-             FROM quota_snapshots q
-             WHERE q.source = ?1
-               AND q.id = (
-                   SELECT q2.id FROM quota_snapshots q2
-                   WHERE q2.source = q.source AND q2.window = q.window
-                   ORDER BY q2.observed_at_utc DESC, q2.id DESC
-                   LIMIT 1
-               )
-             ORDER BY q.window",
-        )?;
-        let rows = stmt
-            .query_map(params![source], |row| {
-                Ok(WindowQuota {
-                    window: row.get(0)?,
-                    used_percent: row.get(1)?,
-                    resets_at_utc: row.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
+    let windows = latest_window_quotas(conn, source)?;
 
     let top_model = attribution(
         conn,
@@ -194,6 +168,37 @@ fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Res
         top_model,
         top_machine,
     })
+}
+
+/// Latest vendor observation per window for a source, ordered by window.
+/// Deterministic: newest `observed_at`, highest row id breaking ties between
+/// same-second snapshots.
+pub(crate) fn latest_window_quotas(
+    conn: &rusqlite::Connection,
+    source: &str,
+) -> crate::error::Result<Vec<WindowQuota>> {
+    let mut stmt = conn.prepare(
+        "SELECT q.window, q.used_percent, q.resets_at_utc
+         FROM quota_snapshots q
+         WHERE q.source = ?1
+           AND q.id = (
+               SELECT q2.id FROM quota_snapshots q2
+               WHERE q2.source = q.source AND q2.window = q.window
+               ORDER BY q2.observed_at_utc DESC, q2.id DESC
+               LIMIT 1
+            )
+          ORDER BY q.window",
+    )?;
+    let rows = stmt
+        .query_map(params![source], |row| {
+            Ok(WindowQuota {
+                window: row.get(0)?,
+                used_percent: row.get(1)?,
+                resets_at_utc: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 fn attribution(

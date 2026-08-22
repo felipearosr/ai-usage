@@ -84,4 +84,52 @@ pub const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     );
     ",
+    // v2 — token columns become nullable. The spec's null discipline says
+    // fields that cannot be determined stay null, never guessed as zero.
+    // SQLite cannot drop constraints in place, so the table is rebuilt and
+    // rows are copied verbatim (v1-era zeros remain zeros: they were
+    // recorded values, not guesses).
+    "
+    ALTER TABLE usage_events RENAME TO usage_events_v1;
+
+    CREATE TABLE usage_events (
+        event_id            TEXT PRIMARY KEY,
+        workspace_id        TEXT NOT NULL,
+        device_id           TEXT NOT NULL REFERENCES devices(device_id),
+        source              TEXT NOT NULL,
+        tool                TEXT NOT NULL,
+        exact_model         TEXT NOT NULL,
+        session_id_hash     TEXT,
+        ts_utc              TEXT NOT NULL,
+        input_tokens        INTEGER,
+        cached_input_tokens INTEGER,
+        cache_write_tokens  INTEGER,
+        output_tokens       INTEGER,
+        reasoning_tokens    INTEGER,
+        reported_cost_micros INTEGER,
+        tool_version        TEXT,
+        adapter_version     TEXT,
+        imported_at_utc     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+
+    INSERT INTO usage_events (
+        event_id, workspace_id, device_id, source, tool, exact_model,
+        session_id_hash, ts_utc,
+        input_tokens, cached_input_tokens, cache_write_tokens,
+        output_tokens, reasoning_tokens,
+        reported_cost_micros, tool_version, adapter_version, imported_at_utc
+    )
+    SELECT
+        event_id, workspace_id, device_id, source, tool, exact_model,
+        session_id_hash, ts_utc,
+        input_tokens, cached_input_tokens, cache_write_tokens,
+        output_tokens, reasoning_tokens,
+        reported_cost_micros, tool_version, adapter_version, imported_at_utc
+    FROM usage_events_v1;
+
+    DROP TABLE usage_events_v1;
+
+    CREATE INDEX idx_usage_events_source_ts ON usage_events(source, ts_utc);
+    CREATE INDEX idx_usage_events_device_ts ON usage_events(device_id, ts_utc);
+    ",
 ];

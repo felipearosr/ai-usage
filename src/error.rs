@@ -7,6 +7,13 @@ pub enum AiuError {
     Db(rusqlite::Error),
     Io(std::io::Error),
     NoDataDir,
+    /// An adapter received data whose format it does not recognize. This is
+    /// loud and source-scoped: that source stops, diagnostics are recorded,
+    /// other sources keep working (spec: contained adapter failure).
+    UnrecognizedFormat {
+        source: &'static str,
+        detail: String,
+    },
 }
 
 impl fmt::Display for AiuError {
@@ -17,6 +24,11 @@ impl fmt::Display for AiuError {
             AiuError::NoDataDir => {
                 write!(f, "could not determine data directory (is HOME set?)")
             }
+            AiuError::UnrecognizedFormat { source, detail } => write!(
+                f,
+                "unrecognized {source} data format — the tool may have changed upstream \
+                 (diagnostic recorded locally): {detail}"
+            ),
         }
     }
 }
