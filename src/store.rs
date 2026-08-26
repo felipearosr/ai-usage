@@ -72,6 +72,16 @@ impl SourceMode {
             SourceMode::Disabled => "disabled",
         }
     }
+
+    /// Parses a persisted mode string. Unknown values fall back to `auto`, the
+    /// default, so a forward-written future mode never breaks collection.
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "enabled" => SourceMode::Enabled,
+            "disabled" => SourceMode::Disabled,
+            _ => SourceMode::Auto,
+        }
+    }
 }
 
 impl Store {
@@ -267,6 +277,22 @@ impl Store {
             rusqlite::params![source, mode.as_str()],
         )?;
         Ok(())
+    }
+
+    /// The current override for `source`, defaulting to `auto` when no row
+    /// exists (never set, or set back to the default). Detection consumes this
+    /// to decide which sources to actually collect (issue 07).
+    pub fn source_mode(&self, source: &str) -> Result<SourceMode> {
+        let value = self.conn.query_row(
+            "SELECT mode FROM source_config WHERE source = ?1",
+            rusqlite::params![source],
+            |row| row.get::<_, String>(0),
+        );
+        match value {
+            Ok(mode) => Ok(SourceMode::parse(&mode)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(SourceMode::Auto),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// The sources aiu is configured to track: every source that has usage or
