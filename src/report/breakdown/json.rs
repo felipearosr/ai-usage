@@ -4,8 +4,9 @@
 
 use serde_json::json;
 
-use crate::report::breakdown::{Matrix, SourceBreakdown, WindowBreakdown};
-use crate::report::detail::{share_percent, VendorQuota};
+use crate::report::breakdown::{SourceBreakdown, WindowBreakdown};
+use crate::report::detail::json::vendor_json;
+use crate::report::detail::share_percent;
 
 pub fn render_matrix(breakdown: &SourceBreakdown) -> String {
     let windows = breakdown
@@ -46,8 +47,10 @@ fn matrix_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value {
             "models": matrix.models,
             "machines": matrix.machines,
             "cells": matrix.cells,
-            "model_totals": row_totals(matrix),
-            "machine_totals": column_totals(matrix),
+            "model_totals": matrix.model_totals(),
+            "machine_totals": matrix.machine_totals(),
+            "model_shares": matrix.model_share_percents(),
+            "machine_shares": matrix.machine_share_percents(),
             "grand_total": matrix.grand_total(),
         },
     })
@@ -84,28 +87,4 @@ fn machines_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value
         "vendor": vendor_json(&window.vendor, now),
         "machines": machines,
     })
-}
-
-fn row_totals(matrix: &Matrix) -> Vec<i64> {
-    (0..matrix.models.len())
-        .map(|i| matrix.model_total(i))
-        .collect()
-}
-
-fn column_totals(matrix: &Matrix) -> Vec<i64> {
-    (0..matrix.machines.len())
-        .map(|j| matrix.machine_total(j))
-        .collect()
-}
-
-fn vendor_json(vendor: &Option<VendorQuota>, now: u64) -> serde_json::Value {
-    match vendor {
-        Some(vendor) => json!({
-            "used_percent": vendor.used_percent,
-            "resets_at": vendor.resets_at_utc,
-            "resets_in_secs": vendor.resets_in_secs(now),
-        }),
-        // Explicit gap in JSON too: absent vendor data is null, not 0%.
-        None => serde_json::Value::Null,
-    }
 }

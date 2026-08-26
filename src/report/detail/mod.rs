@@ -13,6 +13,7 @@ pub mod text;
 
 use rusqlite::params;
 
+use crate::report::has_usage;
 use crate::report::latest_window_quotas;
 use crate::store::Store;
 use crate::utc;
@@ -127,13 +128,7 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         });
     }
 
-    let has_usage: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage_events WHERE source = ?1)",
-            params![source],
-            |row| row.get(0),
-        )
-        .map_err(crate::error::AiuError::from)?;
+    let has_usage: bool = has_usage(conn, source)?;
 
     Ok(SourceDetail {
         source: source.to_string(),

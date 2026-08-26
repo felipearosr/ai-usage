@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use rusqlite::params;
 
 use crate::report::detail::{window_span_secs, VendorQuota};
-use crate::report::latest_window_quotas;
+use crate::report::{has_usage, latest_window_quotas};
 use crate::store::Store;
 use crate::utc;
 
@@ -66,6 +66,36 @@ impl Matrix {
     /// The whole window: the sum of every cell.
     pub fn grand_total(&self) -> i64 {
         self.cells.iter().flat_map(|row| row.iter()).sum()
+    }
+
+    /// Row totals, indexed like [`Matrix::models`].
+    pub fn model_totals(&self) -> Vec<i64> {
+        (0..self.models.len())
+            .map(|i| self.model_total(i))
+            .collect()
+    }
+
+    /// Column totals, indexed like [`Matrix::machines`].
+    pub fn machine_totals(&self) -> Vec<i64> {
+        (0..self.machines.len())
+            .map(|j| self.machine_total(j))
+            .collect()
+    }
+
+    /// Row totals as shares of the whole window, indexed like `models`.
+    pub fn model_share_percents(&self) -> Vec<f64> {
+        let grand = self.grand_total();
+        (0..self.models.len())
+            .map(|i| crate::report::detail::share_percent(self.model_total(i), grand))
+            .collect()
+    }
+
+    /// Column totals as shares of the whole window, indexed like `machines`.
+    pub fn machine_share_percents(&self) -> Vec<f64> {
+        let grand = self.grand_total();
+        (0..self.machines.len())
+            .map(|j| crate::report::detail::share_percent(self.machine_total(j), grand))
+            .collect()
     }
 
     /// True when the window has no usage at all (no positive cells).
@@ -130,13 +160,7 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         });
     }
 
-    let has_usage: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage_events WHERE source = ?1)",
-            params![source],
-            |row| row.get(0),
-        )
-        .map_err(crate::error::AiuError::from)?;
+    let has_usage = has_usage(conn, source)?;
 
     Ok(SourceBreakdown {
         source: source.to_string(),
@@ -149,49 +173,66 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
 /// One aggregated query for the whole window, then pivot in Rust. Rows and
 /// columns with no positive tokens are dropped (zero-use hiding); ordering is
 /// deterministic: descending totals, then name for ties.
+///
+/// The machine dimension is keyed by `device_id` (with the friendly name as
+/// its display label) so two machines sharing a name are kept apart rather
+/// than folded together — machine attribution is per device, not per name.
 fn matrix(
     conn: &rusqlite::Connection,
     source: &str,
     cutoff_utc: &str,
 ) -> crate::error::Result<Matrix> {
     let mut stmt = conn.prepare(
-        "SELECT e.exact_model, d.friendly_name, SUM(e.output_tokens)
+        "SELECT e.exact_model, e.device_id, d.friendly_name, SUM(e.output_tokens)
          FROM usage_events e
          JOIN devices d ON d.device_id = e.device_id
          WHERE e.source = ?1 AND e.ts_utc >= ?2
-         GROUP BY e.exact_model, d.friendly_name
+         GROUP BY e.exact_model, e.device_id, d.friendly_name
          HAVING SUM(e.output_tokens) > 0",
     )?;
     let rows = stmt
         .query_map(params![source, cutoff_utc], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(0)?, // exact_model
+                row.get::<_, String>(1)?, // device_id
+                row.get::<_, String>(2)?, // friendly_name
+                row.get::<_, i64>(3)?,    // output tokens
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
     let mut model_totals: BTreeMap<String, i64> = BTreeMap::new();
+    let mut machine_names: BTreeMap<String, String> = BTreeMap::new();
     let mut machine_totals: BTreeMap<String, i64> = BTreeMap::new();
     let mut cells: BTreeMap<(String, String), i64> = BTreeMap::new();
-    for (model, machine, tokens) in rows {
+    for (model, device_id, name, tokens) in rows {
         *model_totals.entry(model.clone()).or_default() += tokens;
-        *machine_totals.entry(machine.clone()).or_default() += tokens;
-        *cells.entry((model, machine)).or_default() += tokens;
+        machine_names.entry(device_id.clone()).or_insert(name);
+        *machine_totals.entry(device_id.clone()).or_default() += tokens;
+        *cells.entry((model, device_id)).or_default() += tokens;
     }
 
     let mut models: Vec<String> = model_totals.keys().cloned().collect();
     models.sort_by(|a, b| model_totals[b].cmp(&model_totals[a]).then(a.cmp(b)));
-    let mut machines: Vec<String> = machine_totals.keys().cloned().collect();
-    machines.sort_by(|a, b| machine_totals[b].cmp(&machine_totals[a]).then(a.cmp(b)));
+
+    let mut machine_ids: Vec<String> = machine_totals.keys().cloned().collect();
+    machine_ids.sort_by(|a, b| {
+        machine_totals[b]
+            .cmp(&machine_totals[a])
+            .then_with(|| machine_names[a].cmp(&machine_names[b]))
+            .then_with(|| a.cmp(b))
+    });
+    let machines: Vec<String> = machine_ids
+        .iter()
+        .map(|id| machine_names[id].clone())
+        .collect();
 
     let cells = models
         .iter()
         .map(|model| {
-            machines
+            machine_ids
                 .iter()
-                .map(|machine| *cells.get(&(model.clone(), machine.clone())).unwrap_or(&0))
+                .map(|id| *cells.get(&(model.clone(), id.clone())).unwrap_or(&0))
                 .collect()
         })
         .collect();

@@ -836,6 +836,8 @@ fn breakdown_json_emits_the_full_matrix_structurally() {
     assert_eq!(cells[0].as_array().unwrap().len(), 2);
     assert_eq!(matrix["model_totals"][0], 7_000);
     assert_eq!(matrix["machine_totals"][0], 8_000);
+    assert_eq!(matrix["model_shares"][0], 70.0);
+    assert_eq!(matrix["machine_shares"][0], 80.0);
 
     // `machines --json` carries the per-machine model list.
     let mdoc: serde_json::Value =
@@ -892,4 +894,31 @@ fn breakdown_empty_store_prints_init_hint_not_zero() {
     let out = breakdown::text::render_machines(&b);
     assert!(out.contains("no usage recorded yet"), "{out}");
     assert!(out.contains("aiu init"));
+}
+
+#[test]
+fn two_machines_sharing_a_name_stay_separate_columns() {
+    let store = harness();
+    device(&store, "dev-a", "laptop", Some(120));
+    device(&store, "dev-b", "laptop", Some(120)); // same friendly name
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "claude".into(),
+            window: "5h".into(),
+            used_percent: 42.5,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 60),
+            observing_device_id: "dev-a".into(),
+        })
+        .unwrap();
+    event(&store, "a1", "dev-a", "claude", "claude-opus-5", 300);
+    event(&store, "b1", "dev-b", "claude", "claude-opus-5", 700);
+
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let m = &b.windows.iter().find(|w| w.window == "5h").unwrap().matrix;
+
+    // Attribution is per device, not per name: two columns, one per device.
+    assert_eq!(m.machines.len(), 2, "same-named devices kept apart");
+    assert_eq!(m.grand_total(), 1_000);
+    assert_eq!(m.machine_total(0) + m.machine_total(1), 1_000);
 }

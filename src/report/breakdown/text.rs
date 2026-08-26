@@ -2,9 +2,8 @@
 //! `machines` per-machine model list.
 
 use crate::report::breakdown::{SourceBreakdown, WindowBreakdown};
-use crate::report::detail::VendorQuota;
+use crate::report::detail::text::{empty_state, vendor_line};
 use crate::report::text::humanize_tokens;
-use crate::utc;
 
 /// Width reserved for percentage cells ("100.0%").
 const PCT_WIDTH: usize = 6;
@@ -43,16 +42,6 @@ pub fn render_machines(breakdown: &SourceBreakdown) -> String {
         out.push('\n');
     }
     out
-}
-
-fn empty_state(has_usage: bool) -> String {
-    if has_usage {
-        // Usage exists but the vendor has not shown us any quota window.
-        "no vendor snapshot yet — aiu has recorded usage, but no quota window is known\n"
-            .to_string()
-    } else {
-        "no usage recorded yet — run `aiu init` to import history\n".to_string()
-    }
 }
 
 fn render_matrix_window(out: &mut String, window: &WindowBreakdown, now: u64) {
@@ -150,21 +139,4 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
         ));
     }
     out.push_str(&format!("{:>total_width$}\n", "100.0%"));
-}
-
-fn vendor_line(vendor: &Option<VendorQuota>, now: u64) -> String {
-    match vendor {
-        Some(vendor) => {
-            let mut line = format!("vendor quota: {:.1}% used", vendor.used_percent);
-            if let Some(secs) = vendor.resets_in_secs(now) {
-                line.push_str(&format!(
-                    " · resets in {}",
-                    utc::humanize_duration_secs(secs)
-                ));
-            }
-            line
-        }
-        // Missing vendor data is an explicit gap, never zero.
-        None => "vendor quota: no vendor snapshot yet".to_string(),
-    }
 }
