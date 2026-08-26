@@ -73,7 +73,9 @@ impl DeviceFreshness {
             .and_then(crate::utc::parse_rfc3339_utc)
         {
             Some(synced) => now_epoch.saturating_sub(synced) > STALE_AFTER_SECS,
-            None => true,
+            // A device that has never synced is not "silent past 30 minutes";
+            // it is simply unsynced, and renders as such (never STALE).
+            None => false,
         }
     }
 
@@ -91,16 +93,7 @@ pub fn build(store: &Store, now_epoch: u64) -> crate::error::Result<Report> {
     let conn = store.conn();
 
     let sources = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT source FROM (
-                 SELECT source FROM quota_snapshots
-                 UNION
-                 SELECT source FROM usage_events
-             ) ORDER BY source",
-        )?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<String>>>()?;
+        let names = store.configured_sources()?;
         let mut reports = Vec::new();
         for source in names {
             reports.push(source_report(conn, &source)?);

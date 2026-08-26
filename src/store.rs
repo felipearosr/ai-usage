@@ -54,6 +54,26 @@ pub struct NewSnapshot {
     pub observing_device_id: String,
 }
 
+/// Per-source override state (spec story 24). `auto` follows detection,
+/// `enabled` forces collection, `disabled` excludes the source from
+/// collection and reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceMode {
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl SourceMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SourceMode::Auto => "auto",
+            SourceMode::Enabled => "enabled",
+            SourceMode::Disabled => "disabled",
+        }
+    }
+}
+
 impl Store {
     /// Opens (creating if needed) the database file and applies migrations.
     pub fn open(path: &Path) -> Result<Self> {
@@ -212,6 +232,66 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Reads an arbitrary metadata value. `None` when the key is absent.
+    pub fn get_metadata(&self, key: &str) -> Result<Option<String>> {
+        let value = self.conn.query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        );
+        match value {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Writes (or overwrites) an arbitrary metadata value.
+    pub fn set_metadata(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO metadata (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Records a per-source override. Overrides are managed by `aiu sources`
+    /// (issue 07); this is the storage half.
+    pub fn set_source_mode(&self, source: &str, mode: SourceMode) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO source_config (source, mode) VALUES (?1, ?2)
+             ON CONFLICT(source) DO UPDATE SET mode = excluded.mode",
+            rusqlite::params![source, mode.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// The sources aiu is configured to track: every source that has usage or
+    /// quota data plus every source explicitly configured non-disabled,
+    /// minus any source deliberately disabled. Disabled sources are excluded
+    /// even when historical data remains (spec: disabled = excluded from
+    /// reports), so a subset of sources configured renders correctly.
+    pub fn configured_sources(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source FROM (
+                 SELECT source FROM usage_events
+                 UNION
+                 SELECT source FROM quota_snapshots
+                 UNION
+                 SELECT source FROM source_config WHERE mode <> 'disabled'
+             )
+             WHERE source NOT IN (
+                 SELECT source FROM source_config WHERE mode = 'disabled'
+             )
+             ORDER BY source",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
     }
 }
 

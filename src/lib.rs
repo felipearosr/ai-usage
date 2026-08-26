@@ -6,8 +6,11 @@
 
 pub mod adapters;
 pub mod cli;
+pub mod collect;
+pub mod discover;
 pub mod error;
 pub mod hash;
+pub mod identity;
 pub mod import;
 pub mod migrations;
 pub mod paths;

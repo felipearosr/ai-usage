@@ -27,6 +27,11 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The user's home directory, used by local source-file discovery.
+pub fn home() -> Option<PathBuf> {
+    home_dir()
+}
+
 fn default_data_dir_for(home: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         home.join("Library/Application Support/aiu")
