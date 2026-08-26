@@ -1,7 +1,8 @@
 //! Argument parsing without external dependencies.
 //!
 //! Surface: `aiu` renders the compact overview report, `aiu claude` renders
-//! the Claude Code detail view; `--json` switches either to JSON.
+//! the Claude Code detail view, `aiu codex` renders the Codex detail view;
+//! `--json` switches either to JSON.
 
 use std::fmt;
 
@@ -30,6 +31,7 @@ aiu — AI coding subscription usage tracker
 USAGE:
     aiu [--json]            compact overview across sources
     aiu claude [--json]     Claude Code detail view (per-window quota + attribution)
+    aiu codex [--json]      Codex detail view (per-window quota + attribution)
 
 OPTIONS:
     --json      Render as JSON
@@ -67,8 +69,12 @@ where
             source: "claude".to_string(),
             json,
         }),
+        Some("codex") => Ok(Command::Detail {
+            source: "codex".to_string(),
+            json,
+        }),
         Some(other) => Err(ArgsError(format!(
-            "unknown command: {other}\navailable detail views: claude\n\n{USAGE}"
+            "unknown command: {other}\navailable detail views: claude, codex\n\n{USAGE}"
         ))),
     }
 }
@@ -118,6 +124,24 @@ mod tests {
             parse(args(&["--json", "claude"])).unwrap(),
             Command::Detail {
                 source: "claude".to_string(),
+                json: true
+            }
+        );
+    }
+
+    #[test]
+    fn codex_detail_is_recognized() {
+        assert_eq!(
+            parse(args(&["codex"])).unwrap(),
+            Command::Detail {
+                source: "codex".to_string(),
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(args(&["codex", "--json"])).unwrap(),
+            Command::Detail {
+                source: "codex".to_string(),
                 json: true
             }
         );

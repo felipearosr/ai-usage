@@ -394,3 +394,105 @@ fn claude_detail_empty_store_prints_init_hint_not_zero() {
     assert!(out.contains("no usage recorded yet"));
     assert!(out.contains("aiu init"));
 }
+
+// ---- `aiu codex` detail view (issue 03) ------------------------------------
+
+fn codex_detail_fixture() -> Store {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    device(&store, "dev-desk", "desktop", Some(120));
+    snapshot(&store, "codex", "5h", 61.0, Some(2220)); // resets in 37m
+    snapshot(&store, "codex", "week", 20.0, None);
+    event(&store, "cx1", "dev-laptop", "codex", "gpt-5-codex", 8_000);
+    event(&store, "cx2", "dev-desk", "codex", "gpt-5.2-codex", 2_000);
+    // Outside the 5h window but inside the week window.
+    let mut old = NewEvent {
+        event_id: "cx3".into(),
+        workspace_id: "ws".into(),
+        device_id: "dev-laptop".into(),
+        source: "codex".into(),
+        tool: "codex".into(),
+        exact_model: "gpt-5.1-codex".into(),
+        ts_utc: utc::format_epoch(NOW - 6 * 3600),
+        ..Default::default()
+    };
+    old.output_tokens = Some(500);
+    store.record_event(&old).unwrap();
+    store
+}
+
+#[test]
+fn codex_detail_shows_vendor_and_attribution_per_window() {
+    let store = codex_detail_fixture();
+    let d = detail::build(&store, "codex", NOW).unwrap();
+    let out = detail::text::render(&d);
+
+    assert!(out.contains("codex"));
+    assert!(out.contains("[5h]"));
+    assert!(out.contains("vendor quota: 61.0% used"), "{out}");
+    assert!(out.contains("resets in 37m"), "{out}");
+
+    let five_h = d.windows.iter().find(|w| w.window == "5h").unwrap();
+    assert_eq!(five_h.models.len(), 2, "5h excludes the 6h-old event");
+    assert_eq!(five_h.machines.len(), 2);
+    let week = d.windows.iter().find(|w| w.window == "week").unwrap();
+    assert_eq!(week.models.len(), 3, "week includes the gpt-5.1 event");
+}
+
+#[test]
+fn codex_detail_json_shape_matches_text_semantics() {
+    use serde_json::Value;
+    let store = codex_detail_fixture();
+    let d = detail::build(&store, "codex", NOW).unwrap();
+    let doc: Value = serde_json::from_str(&detail::json::render(&d)).expect("valid JSON");
+
+    assert_eq!(doc["source"], "codex");
+    let five_h = doc["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["window"] == "5h")
+        .unwrap();
+    assert_eq!(five_h["vendor"]["used_percent"], 61.0);
+    assert_eq!(five_h["vendor"]["resets_in_secs"], 2220);
+    assert_eq!(five_h["attribution"]["total_output_tokens"], 10_000);
+    let models = five_h["attribution"]["models"].as_array().unwrap();
+    assert_eq!(models[0]["name"], "gpt-5-codex");
+    assert_eq!(models[0]["share_percent"], 80.0);
+}
+
+#[test]
+fn claude_and_codex_remain_independent_accounting_domains() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    snapshot(&store, "claude", "5h", 42.5, Some(4440));
+    snapshot(&store, "codex", "week", 20.0, None);
+    event(
+        &store,
+        "cl1",
+        "dev-laptop",
+        "claude",
+        "claude-opus-5",
+        12_000,
+    );
+    event(&store, "cx1", "dev-laptop", "codex", "gpt-5-codex", 800);
+
+    let r = report::build(&store, NOW).unwrap();
+    let claude = r.sources.iter().find(|s| s.source == "claude").unwrap();
+    let codex = r.sources.iter().find(|s| s.source == "codex").unwrap();
+
+    assert!(claude.windows.iter().any(|w| w.window == "5h"));
+    assert!(!claude.windows.iter().any(|w| w.window == "week"));
+    assert_eq!(claude.top_model.as_ref().unwrap().name, "claude-opus-5");
+    assert_eq!(codex.top_model.as_ref().unwrap().name, "gpt-5-codex");
+    assert_eq!(
+        codex
+            .windows
+            .iter()
+            .find(|w| w.window == "week")
+            .unwrap()
+            .used_percent,
+        20.0
+    );
+    assert!(!codex.windows.iter().any(|w| w.window == "5h"));
+}
