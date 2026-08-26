@@ -46,6 +46,7 @@ fn matrix_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value {
         "matrix": {
             "models": matrix.models,
             "machines": matrix.machines,
+            "machine_ids": matrix.machine_ids,
             "cells": matrix.cells,
             "model_totals": matrix.model_totals(),
             "machine_totals": matrix.machine_totals(),
@@ -66,6 +67,7 @@ fn machines_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value
         .map(|(j, name)| {
             let total = matrix.machine_total(j);
             json!({
+                "device_id": matrix.machine_ids[j],
                 "name": name,
                 "output_tokens": total,
                 "share_percent": share_percent(total, grand),

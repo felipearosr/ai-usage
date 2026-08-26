@@ -48,6 +48,10 @@ pub struct Matrix {
     pub models: Vec<String>,
     /// Column labels (machines), ordered by descending machine total.
     pub machines: Vec<String>,
+    /// Device ids parallel to [`Matrix::machines`]. Machines are keyed by
+    /// device id; the friendly name is display only, so two machines sharing
+    /// a name stay distinguishable downstream.
+    pub machine_ids: Vec<String>,
     /// `cells[model][machine]` output tokens within this window.
     pub cells: Vec<Vec<i64>>,
 }
@@ -172,7 +176,7 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
 
 /// One aggregated query for the whole window, then pivot in Rust. Rows and
 /// columns with no positive tokens are dropped (zero-use hiding); ordering is
-/// deterministic: descending totals, then name for ties.
+/// deterministic: descending totals, then name, then device id for ties.
 ///
 /// The machine dimension is keyed by `device_id` (with the friendly name as
 /// its display label) so two machines sharing a name are kept apart rather
@@ -240,6 +244,7 @@ fn matrix(
     Ok(Matrix {
         models,
         machines,
+        machine_ids,
         cells,
     })
 }

@@ -830,6 +830,7 @@ fn breakdown_json_emits_the_full_matrix_structurally() {
     let matrix = &five_h["matrix"];
     assert_eq!(matrix["models"].as_array().unwrap().len(), 2);
     assert_eq!(matrix["machines"].as_array().unwrap().len(), 2);
+    assert_eq!(matrix["machine_ids"].as_array().unwrap().len(), 2);
     assert_eq!(matrix["grand_total"], 10_000);
     let cells = matrix["cells"].as_array().unwrap();
     assert_eq!(cells.len(), 2);
@@ -919,6 +920,18 @@ fn two_machines_sharing_a_name_stay_separate_columns() {
 
     // Attribution is per device, not per name: two columns, one per device.
     assert_eq!(m.machines.len(), 2, "same-named devices kept apart");
+    assert_eq!(m.machine_ids.len(), 2);
     assert_eq!(m.grand_total(), 1_000);
     assert_eq!(m.machine_total(0) + m.machine_total(1), 1_000);
+
+    // The disambiguating device id surfaces in the machines JSON.
+    let doc: serde_json::Value =
+        serde_json::from_str(&breakdown::json::render_machines(&b)).unwrap();
+    let machines = doc["windows"][0]["machines"].as_array().unwrap();
+    let ids: Vec<&str> = machines
+        .iter()
+        .map(|x| x["device_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"dev-a"));
+    assert!(ids.contains(&"dev-b"));
 }
