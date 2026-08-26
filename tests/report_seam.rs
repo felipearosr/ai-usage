@@ -646,3 +646,292 @@ fn claude_and_codex_remain_independent_accounting_domains() {
     );
     assert!(!codex.windows.iter().any(|w| w.window == "5h"));
 }
+
+// ---- `aiu <source> models` / `machines` breakdowns (issue 06) ---------------
+
+use aiu::report::breakdown;
+
+/// Multi-machine, multi-model, multi-window fixture with clean percentages:
+/// within the 5h window, laptop (80%) and desktop (20%) split opus-5 (70%)
+/// and sonnet-4 (30%) across four cells summing to 100%.
+fn matrix_fixture() -> Store {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    device(&store, "dev-desk", "desktop", Some(120));
+    device(&store, "dev-box", "boxonly", Some(120)); // never touches claude
+
+    snapshot(&store, "claude", "5h", 42.5, Some(4440));
+    snapshot(&store, "claude", "week", 12.3, None);
+
+    event(&store, "m1", "dev-laptop", "claude", "claude-opus-5", 6_000);
+    event(
+        &store,
+        "m2",
+        "dev-laptop",
+        "claude",
+        "claude-sonnet-4",
+        2_000,
+    );
+    event(&store, "m3", "dev-desk", "claude", "claude-opus-5", 1_000);
+    event(&store, "m4", "dev-desk", "claude", "claude-sonnet-4", 1_000);
+
+    // Zero-use model: hidden entirely.
+    event(&store, "m5", "dev-laptop", "claude", "claude-haiku-4", 0);
+
+    // Non-participating machine: go only, absent from claude's matrix.
+    event(&store, "m6", "dev-box", "go", "opengo-4", 400);
+
+    // Outside the 5h window but inside the week window.
+    let mut old = NewEvent {
+        event_id: "m7".into(),
+        workspace_id: "ws".into(),
+        device_id: "dev-laptop".into(),
+        source: "claude".into(),
+        tool: "claude-code".into(),
+        exact_model: "claude-opus-4.8".into(),
+        ts_utc: utc::format_epoch(NOW - 6 * 3600),
+        ..Default::default()
+    };
+    old.output_tokens = Some(500);
+    store.record_event(&old).unwrap();
+    store
+}
+
+#[test]
+fn matrix_rows_columns_and_cells_each_sum_to_the_whole_window() {
+    let store = matrix_fixture();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let five_h = b.windows.iter().find(|w| w.window == "5h").unwrap();
+    let m = &five_h.matrix;
+
+    assert_eq!(
+        m.models,
+        vec!["claude-opus-5".to_string(), "claude-sonnet-4".to_string()]
+    );
+    assert_eq!(
+        m.machines,
+        vec!["laptop".to_string(), "desktop".to_string()]
+    );
+    assert_eq!(m.grand_total(), 10_000);
+
+    // Row totals equal model share, column totals equal machine share, and
+    // every cell plus the two margins each sum to exactly 100%.
+    let grand = m.grand_total() as f64;
+    let row_sum: f64 = (0..m.models.len())
+        .map(|i| m.model_total(i) as f64 / grand * 100.0)
+        .sum();
+    let col_sum: f64 = (0..m.machines.len())
+        .map(|j| m.machine_total(j) as f64 / grand * 100.0)
+        .sum();
+    let cell_sum: f64 = m
+        .cells
+        .iter()
+        .flatten()
+        .map(|c| *c as f64 / grand * 100.0)
+        .sum();
+    assert!(
+        (row_sum - 100.0).abs() < 1e-9,
+        "rows sum to 100%: {row_sum}"
+    );
+    assert!(
+        (col_sum - 100.0).abs() < 1e-9,
+        "columns sum to 100%: {col_sum}"
+    );
+    assert!(
+        (cell_sum - 100.0).abs() < 1e-9,
+        "cells sum to 100%: {cell_sum}"
+    );
+
+    // Spot-check exact shares: laptop 80%, opus-5 70%, laptop×opus-5 60%.
+    assert_eq!(m.model_total(0), 7_000);
+    assert_eq!(m.machine_total(0), 8_000);
+    assert_eq!(m.cells[0][0], 6_000);
+}
+
+#[test]
+fn matrix_hides_zero_use_models_and_non_participating_machines() {
+    let store = matrix_fixture();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let five_h = b.windows.iter().find(|w| w.window == "5h").unwrap();
+    let m = &five_h.matrix;
+
+    assert!(
+        !m.models.iter().any(|x| x == "claude-haiku-4"),
+        "zero-use model hidden entirely"
+    );
+    assert!(
+        !m.machines.iter().any(|x| x == "boxonly"),
+        "non-participating machine hidden entirely"
+    );
+}
+
+#[test]
+fn breakdown_filters_to_the_exact_window_shown() {
+    let store = matrix_fixture();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let five_h = b.windows.iter().find(|w| w.window == "5h").unwrap();
+    let week = b.windows.iter().find(|w| w.window == "week").unwrap();
+
+    assert_eq!(five_h.matrix.grand_total(), 10_000);
+    assert!(
+        !five_h.matrix.models.iter().any(|m| m == "claude-opus-4.8"),
+        "5h excludes the 6h-old event"
+    );
+    assert_eq!(week.matrix.grand_total(), 10_500);
+    assert!(week.matrix.models.iter().any(|m| m == "claude-opus-4.8"));
+}
+
+#[test]
+fn models_and_machines_render_text_for_the_window() {
+    let store = matrix_fixture();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+
+    let models_out = breakdown::text::render_models(&b);
+    assert!(
+        models_out.contains("machine × model matrix"),
+        "{models_out}"
+    );
+    assert!(models_out.contains("claude-opus-5"));
+    assert!(
+        models_out.contains("60.0%"),
+        "laptop×opus-5 cell: {models_out}"
+    );
+
+    let machines_out = breakdown::text::render_machines(&b);
+    assert!(machines_out.contains("laptop"), "{machines_out}");
+    assert!(
+        machines_out.contains("80.0%"),
+        "laptop machine share: {machines_out}"
+    );
+    assert!(
+        machines_out.contains("75.0%"),
+        "laptop's per-machine opus-5 share: {machines_out}"
+    );
+    assert!(
+        !machines_out.contains("boxonly"),
+        "non-participating machine absent"
+    );
+}
+
+#[test]
+fn breakdown_json_emits_the_full_matrix_structurally() {
+    let store = matrix_fixture();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&breakdown::json::render_matrix(&b)).expect("valid JSON");
+    assert_eq!(doc["source"], "claude");
+    let five_h = doc["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["window"] == "5h")
+        .unwrap();
+    let matrix = &five_h["matrix"];
+    assert_eq!(matrix["models"].as_array().unwrap().len(), 2);
+    assert_eq!(matrix["machines"].as_array().unwrap().len(), 2);
+    assert_eq!(matrix["machine_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(matrix["grand_total"], 10_000);
+    let cells = matrix["cells"].as_array().unwrap();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(cells[0].as_array().unwrap().len(), 2);
+    assert_eq!(matrix["model_totals"][0], 7_000);
+    assert_eq!(matrix["machine_totals"][0], 8_000);
+    assert_eq!(matrix["model_shares"][0], 70.0);
+    assert_eq!(matrix["machine_shares"][0], 80.0);
+
+    // `machines --json` carries the per-machine model list.
+    let mdoc: serde_json::Value =
+        serde_json::from_str(&breakdown::json::render_machines(&b)).expect("valid JSON");
+    let m5h = mdoc["windows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["window"] == "5h")
+        .unwrap();
+    let machines = m5h["machines"].as_array().unwrap();
+    assert_eq!(machines[0]["name"], "laptop");
+    assert_eq!(machines[0]["share_percent"], 80.0);
+    assert_eq!(machines[0]["models"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn every_source_has_working_models_and_machines_breakdowns() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    snapshot(&store, "codex", "5h", 61.0, Some(2220));
+    snapshot(&store, "go", "5h", 30.0, None);
+    event(&store, "x1", "dev-laptop", "codex", "gpt-5-codex", 8_000);
+    event(&store, "g1", "dev-laptop", "go", "opengo-4", 2_000);
+
+    for source in ["codex", "go"] {
+        let b = breakdown::build(&store, source, NOW).unwrap();
+        let five_h = b.windows.iter().find(|w| w.window == "5h").unwrap();
+        assert!(!five_h.matrix.is_empty(), "{source} matrix populated");
+        let models = breakdown::text::render_models(&b);
+        let machines = breakdown::text::render_machines(&b);
+        assert!(models.contains(source), "{source} models header");
+        assert!(machines.contains("laptop"), "{source} machines list");
+    }
+}
+
+#[test]
+fn breakdown_without_vendor_snapshot_renders_explicit_gap() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    event(&store, "g1", "dev-laptop", "go", "opengo-4", 100);
+
+    let b = breakdown::build(&store, "go", NOW).unwrap();
+    assert_eq!(b.has_usage, true);
+    assert_eq!(b.windows.len(), 0);
+    let out = breakdown::text::render_models(&b);
+    assert!(out.contains("no vendor snapshot yet"), "{out}");
+}
+
+#[test]
+fn breakdown_empty_store_prints_init_hint_not_zero() {
+    let store = harness();
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let out = breakdown::text::render_machines(&b);
+    assert!(out.contains("no usage recorded yet"), "{out}");
+    assert!(out.contains("aiu init"));
+}
+
+#[test]
+fn two_machines_sharing_a_name_stay_separate_columns() {
+    let store = harness();
+    device(&store, "dev-a", "laptop", Some(120));
+    device(&store, "dev-b", "laptop", Some(120)); // same friendly name
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "claude".into(),
+            window: "5h".into(),
+            used_percent: 42.5,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 60),
+            observing_device_id: "dev-a".into(),
+        })
+        .unwrap();
+    event(&store, "a1", "dev-a", "claude", "claude-opus-5", 300);
+    event(&store, "b1", "dev-b", "claude", "claude-opus-5", 700);
+
+    let b = breakdown::build(&store, "claude", NOW).unwrap();
+    let m = &b.windows.iter().find(|w| w.window == "5h").unwrap().matrix;
+
+    // Attribution is per device, not per name: two columns, one per device.
+    assert_eq!(m.machines.len(), 2, "same-named devices kept apart");
+    assert_eq!(m.machine_ids.len(), 2);
+    assert_eq!(m.grand_total(), 1_000);
+    assert_eq!(m.machine_total(0) + m.machine_total(1), 1_000);
+
+    // The disambiguating device id surfaces in the machines JSON.
+    let doc: serde_json::Value =
+        serde_json::from_str(&breakdown::json::render_machines(&b)).unwrap();
+    let machines = doc["windows"][0]["machines"].as_array().unwrap();
+    let ids: Vec<&str> = machines
+        .iter()
+        .map(|x| x["device_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"dev-a"));
+    assert!(ids.contains(&"dev-b"));
+}

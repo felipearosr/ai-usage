@@ -1,6 +1,6 @@
 //! Plain-text rendering of a [`SourceDetail`].
 
-use crate::report::detail::{SourceDetail, WindowDetail};
+use crate::report::detail::{SourceDetail, VendorQuota, WindowDetail};
 use crate::report::text::humanize_tokens;
 use crate::utc;
 
@@ -11,15 +11,7 @@ pub fn render(detail: &SourceDetail) -> String {
 
     if detail.windows.is_empty() {
         out.push('\n');
-        if detail.has_usage {
-            // Usage exists but the vendor has not shown us any quota window:
-            // an explicit gap, never zero and never silence.
-            out.push_str(
-                "no vendor snapshot yet — aiu has recorded usage, but no quota window is known\n",
-            );
-        } else {
-            out.push_str("no usage recorded yet — run `aiu init` to import history\n");
-        }
+        out.push_str(&empty_state(detail.has_usage));
         return out;
     }
 
@@ -30,10 +22,24 @@ pub fn render(detail: &SourceDetail) -> String {
     out
 }
 
-fn render_window(out: &mut String, window: &WindowDetail, now: u64) {
-    out.push_str(&format!("[{}]\n", window.window));
+/// The message rendered when no vendor window is known: an explicit gap when
+/// usage exists, an init hint when nothing has been recorded. Shared with the
+/// breakdown renderers so both output formats stay identical.
+pub(crate) fn empty_state(has_usage: bool) -> String {
+    if has_usage {
+        // Usage exists but the vendor has not shown us any quota window:
+        // an explicit gap, never zero and never silence.
+        "no vendor snapshot yet — aiu has recorded usage, but no quota window is known\n"
+            .to_string()
+    } else {
+        "no usage recorded yet — run `aiu init` to import history\n".to_string()
+    }
+}
 
-    match &window.vendor {
+/// The vendor-quota line ("vendor quota: 42.5% used · resets in 1h 14m"),
+/// shared with the breakdown renderers. Missing data is an explicit gap.
+pub(crate) fn vendor_line(vendor: &Option<VendorQuota>, now: u64) -> String {
+    match vendor {
         Some(vendor) => {
             let mut line = format!("vendor quota: {:.1}% used", vendor.used_percent);
             if let Some(secs) = vendor.resets_in_secs(now) {
@@ -42,14 +48,16 @@ fn render_window(out: &mut String, window: &WindowDetail, now: u64) {
                     utc::humanize_duration_secs(secs)
                 ));
             }
-            out.push_str(&line);
-            out.push('\n');
+            line
         }
-        None => {
-            // Missing vendor data is an explicit gap, never zero.
-            out.push_str("vendor quota: no vendor snapshot yet\n");
-        }
+        None => "vendor quota: no vendor snapshot yet".to_string(),
     }
+}
+
+fn render_window(out: &mut String, window: &WindowDetail, now: u64) {
+    out.push_str(&format!("[{}]\n", window.window));
+    out.push_str(&vendor_line(&window.vendor, now));
+    out.push('\n');
 
     if window.machines.is_empty() && window.models.is_empty() {
         out.push_str("aiu attribution: no usage recorded in this window\n");

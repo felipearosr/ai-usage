@@ -13,6 +13,7 @@ pub mod text;
 
 use rusqlite::params;
 
+use crate::report::has_usage;
 use crate::report::latest_window_quotas;
 use crate::store::Store;
 use crate::utc;
@@ -21,7 +22,7 @@ use crate::utc;
 /// maps the window names vendors report to their rolling duration so
 /// breakdowns can be filtered to exactly the window shown. Windows without
 /// an entry render vendor data but no attribution span.
-fn window_span_secs(window: &str) -> Option<u64> {
+pub(crate) fn window_span_secs(window: &str) -> Option<u64> {
     match window {
         "5h" => Some(5 * 3600),
         "week" => Some(7 * 86_400),
@@ -127,13 +128,7 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         });
     }
 
-    let has_usage: bool = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM usage_events WHERE source = ?1)",
-            params![source],
-            |row| row.get(0),
-        )
-        .map_err(crate::error::AiuError::from)?;
+    let has_usage: bool = has_usage(conn, source)?;
 
     Ok(SourceDetail {
         source: source.to_string(),
@@ -166,7 +161,7 @@ fn shares(
         .collect())
 }
 
-fn share_percent(tokens: i64, total: i64) -> f64 {
+pub(crate) fn share_percent(tokens: i64, total: i64) -> f64 {
     if total == 0 {
         return 0.0;
     }

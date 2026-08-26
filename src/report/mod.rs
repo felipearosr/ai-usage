@@ -5,6 +5,7 @@
 //! feeds normalized events/snapshots into an in-memory store and asserts on
 //! what comes out here.
 
+pub mod breakdown;
 pub mod detail;
 pub mod json;
 pub mod text;
@@ -161,6 +162,17 @@ fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Res
         top_model,
         top_machine,
     })
+}
+
+/// True when at least one usage event exists for `source`. Shared by the
+/// detail and breakdown builders so an empty window never renders as silence.
+pub(crate) fn has_usage(conn: &rusqlite::Connection, source: &str) -> crate::error::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM usage_events WHERE source = ?1)",
+        params![source],
+        |row| row.get(0),
+    )
+    .map_err(crate::error::AiuError::from)
 }
 
 /// Latest vendor observation per window for a source, ordered by window.

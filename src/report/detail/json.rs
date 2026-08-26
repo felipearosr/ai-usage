@@ -2,7 +2,7 @@
 
 use serde_json::json;
 
-use crate::report::detail::{SourceDetail, WindowDetail};
+use crate::report::detail::{SourceDetail, VendorQuota, WindowDetail};
 
 pub fn render(detail: &SourceDetail) -> String {
     let windows = detail
@@ -20,16 +20,21 @@ pub fn render(detail: &SourceDetail) -> String {
     serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn window_json(window: &WindowDetail, now: u64) -> serde_json::Value {
-    let vendor = match &window.vendor {
+/// Vendor block for one window, shared with the breakdown renderers. Absent
+/// vendor data is null, never 0%.
+pub(crate) fn vendor_json(vendor: &Option<VendorQuota>, now: u64) -> serde_json::Value {
+    match vendor {
         Some(vendor) => json!({
             "used_percent": vendor.used_percent,
             "resets_at": vendor.resets_at_utc,
             "resets_in_secs": vendor.resets_in_secs(now),
         }),
-        // Explicit gap in JSON too: absent vendor data is null, not 0%.
         None => serde_json::Value::Null,
-    };
+    }
+}
+
+fn window_json(window: &WindowDetail, now: u64) -> serde_json::Value {
+    let vendor = vendor_json(&window.vendor, now);
 
     let total: i64 = window.machines.iter().map(|m| m.output_tokens).sum();
     json!({

@@ -1,6 +1,6 @@
-use aiu::cli::{self, Command};
+use aiu::cli::{self, BreakdownKind, Command};
 use aiu::paths;
-use aiu::report::{self, detail};
+use aiu::report::{self, breakdown, detail};
 use aiu::store::Store;
 
 fn main() {
@@ -15,6 +15,11 @@ fn main() {
         }
         Ok(Command::Detail { source, json }) => {
             if let Err(e) = run_detail(&source, json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::Breakdown { source, kind, json }) => {
+            if let Err(e) = run_breakdown(&source, kind, json) {
                 die(1, e);
             }
         }
@@ -86,6 +91,26 @@ fn run_detail(source: &str, json_format: bool) -> Result<(), Box<dyn std::error:
         print!("{}", detail::json::render(&detail));
     } else {
         print!("{}", detail::text::render(&detail));
+    }
+    Ok(())
+}
+
+fn run_breakdown(
+    source: &str,
+    kind: BreakdownKind,
+    json_format: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let breakdown = breakdown::build(&store, source, aiu::utc::now_epoch())?;
+    match (kind, json_format) {
+        (BreakdownKind::Models, true) => print!("{}", breakdown::json::render_matrix(&breakdown)),
+        (BreakdownKind::Models, false) => print!("{}", breakdown::text::render_models(&breakdown)),
+        (BreakdownKind::Machines, true) => {
+            print!("{}", breakdown::json::render_machines(&breakdown))
+        }
+        (BreakdownKind::Machines, false) => {
+            print!("{}", breakdown::text::render_machines(&breakdown))
+        }
     }
     Ok(())
 }
