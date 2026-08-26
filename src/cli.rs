@@ -9,6 +9,8 @@
 
 use std::fmt;
 
+use crate::store::SourceMode;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Report {
@@ -30,7 +32,7 @@ pub enum Command {
         json: bool,
     },
     SourcesSet {
-        mode: SourceModeArg,
+        mode: SourceMode,
         source: String,
         json: bool,
     },
@@ -42,14 +44,6 @@ pub enum Command {
 pub enum BreakdownKind {
     Models,
     Machines,
-}
-
-/// The override target for `aiu sources enable|disable|auto <source>`.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SourceModeArg {
-    Auto,
-    Enabled,
-    Disabled,
 }
 
 #[derive(Debug)]
@@ -92,11 +86,11 @@ fn is_source(name: &str) -> bool {
     SOURCES.contains(&name)
 }
 
-fn mode_arg(word: &str) -> Option<SourceModeArg> {
+fn mode_arg(word: &str) -> Option<SourceMode> {
     match word {
-        "auto" => Some(SourceModeArg::Auto),
-        "enable" => Some(SourceModeArg::Enabled),
-        "disable" => Some(SourceModeArg::Disabled),
+        "auto" => Some(SourceMode::Auto),
+        "enable" => Some(SourceMode::Enabled),
+        "disable" => Some(SourceMode::Disabled),
         _ => None,
     }
 }
@@ -304,9 +298,9 @@ mod tests {
             Command::SourcesDetect { json: false }
         );
         for (word, mode) in [
-            ("enable", SourceModeArg::Enabled),
-            ("disable", SourceModeArg::Disabled),
-            ("auto", SourceModeArg::Auto),
+            ("enable", SourceMode::Enabled),
+            ("disable", SourceMode::Disabled),
+            ("auto", SourceMode::Auto),
         ] {
             for source in SOURCES {
                 assert_eq!(

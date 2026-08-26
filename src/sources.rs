@@ -33,35 +33,38 @@ pub struct SourceStatus {
     pub detected: bool,
 }
 
-impl SourceStatus {
-    /// Whether collection will actually drive this source given its override
-    /// and detection state. `enabled` wins over detection, `disabled` loses,
-    /// `auto` follows the filesystem.
-    pub fn tracked(&self) -> bool {
-        should_collect(self.mode, self.detected)
-    }
-}
-
 /// Runs detection for every known source. Cheap: a single `is_dir` stat per
 /// source, no recursion, no file listing.
 pub fn detect(home: &Path) -> Vec<Detection> {
+    let xdg = std::env::var("XDG_DATA_HOME").ok();
+    detect_with(home, xdg.as_deref())
+}
+
+/// Detection with an explicit `XDG_DATA_HOME` override, so tests can exercise
+/// non-default installs without mutating process-global environment state.
+fn detect_with(home: &Path, xdg_data_home: Option<&str>) -> Vec<Detection> {
     ALL_SOURCES
         .iter()
         .map(|&source| Detection {
             source,
-            detected: sentinel_dir(home, source).is_dir(),
+            detected: sentinel_dir(home, source, xdg_data_home).is_dir(),
         })
         .collect()
 }
 
 /// The directory whose existence marks a source as installed on this machine.
-fn sentinel_dir(home: &Path, source: &str) -> PathBuf {
+fn sentinel_dir(home: &Path, source: &str, xdg_data_home: Option<&str>) -> PathBuf {
     match source {
         "claude" => home.join(".claude/projects"),
         "codex" => home.join(".codex/sessions"),
-        // OpenCode stores its data under `~/.local/share/opencode` on both
-        // macOS and Linux (it follows the XDG layout on both).
-        "go" => home.join(".local/share/opencode"),
+        // OpenCode stores its data under `~/.local/share/opencode` (it follows
+        // the XDG layout on both macOS and Linux). Honor `XDG_DATA_HOME` the
+        // same way aiu's own data dir does, so a non-default Linux install is
+        // still detected.
+        "go" => match xdg_data_home {
+            Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg).join("opencode"),
+            _ => home.join(".local/share/opencode"),
+        },
         _ => home.join(".never-present"),
     }
 }
@@ -93,23 +96,18 @@ pub fn statuses(store: &Store, home: &Path) -> Result<Vec<SourceStatus>> {
 }
 
 /// Renders `aiu sources` as text: one line per source with its mode and
-/// detected status, and a marker for sources currently tracked.
+/// detected status.
 pub fn render_statuses(statuses: &[SourceStatus]) -> String {
     let mut out = String::from("SOURCES\n");
     for s in statuses {
         out.push_str(&format!(
-            "  {:<8} {:<8} {} ({})\n",
+            "  {:<8} {:<8} {}\n",
             s.source,
             s.mode.as_str(),
             if s.detected {
                 "detected"
             } else {
                 "not detected"
-            },
-            if s.tracked() {
-                "tracked"
-            } else {
-                "not tracked"
             },
         ));
     }
@@ -125,12 +123,25 @@ pub fn render_statuses_json(statuses: &[SourceStatus]) -> String {
                 "source": s.source,
                 "mode": s.mode.as_str(),
                 "detected": s.detected,
-                "tracked": s.tracked(),
             })
         })
         .collect::<Vec<_>>();
     serde_json::to_string_pretty(&serde_json::json!({ "sources": sources }))
         .unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Renders `aiu sources enable|disable|auto <source>` confirmation.
+pub fn render_set(source: &str, mode: SourceMode) -> String {
+    format!("{source}: {}\n", mode.as_str())
+}
+
+/// Renders `aiu sources enable|disable|auto <source>` confirmation as JSON.
+pub fn render_set_json(source: &str, mode: SourceMode) -> String {
+    serde_json::to_string_pretty(&serde_json::json!({
+        "source": source,
+        "mode": mode.as_str(),
+    }))
+    .unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Renders `aiu sources detect` as text: detected status only.
@@ -240,14 +251,12 @@ mod tests {
         let by_name = |name: &str| statuses.iter().find(|s| s.source == name).unwrap();
 
         assert_eq!(by_name("claude").mode, SourceMode::Auto);
-        assert!(by_name("claude").tracked(), "auto + detected");
+        assert!(by_name("claude").detected);
 
         assert_eq!(by_name("go").mode, SourceMode::Enabled);
-        assert!(by_name("go").tracked(), "enabled tracked even undetected");
-        assert!(!by_name("go").detected);
+        assert!(!by_name("go").detected, "enabled but not present");
 
         assert_eq!(by_name("codex").mode, SourceMode::Disabled);
-        assert!(!by_name("codex").tracked());
 
         let _ = fs::remove_dir_all(&home);
     }
@@ -270,6 +279,27 @@ mod tests {
         assert!(text.contains("claude") && text.contains("auto"));
         assert!(text.contains("detected"));
         assert!(text.contains("not detected"), "{text}");
-        assert!(text.contains("tracked"), "{text}");
+    }
+
+    #[test]
+    fn go_detection_honors_xdg_data_home() {
+        // A non-default XDG_DATA_HOME changes go's sentinel without touching
+        // process-global environment state (detection is exercised directly).
+        let xdg = std::env::temp_dir().join(format!("aiu-xdg-{}", std::process::id()));
+        let home = tmp("xdg-home");
+        std::fs::create_dir_all(xdg.join("opencode")).unwrap();
+
+        let xdg_str = xdg.to_str().unwrap();
+        let detections = detect_with(&home, Some(xdg_str));
+        let go = detections.iter().find(|d| d.source == "go").unwrap();
+        assert!(go.detected, "go detected via XDG_DATA_HOME");
+
+        // Without XDG_DATA_HOME, go falls back to `~/.local/share/opencode`.
+        let default = detect_with(&home, None);
+        let go_default = default.iter().find(|d| d.source == "go").unwrap();
+        assert!(!go_default.detected, "no fallback sentinel present");
+
+        let _ = std::fs::remove_dir_all(&xdg);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

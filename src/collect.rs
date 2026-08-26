@@ -106,8 +106,10 @@ pub fn adapter_for(source: &str) -> Option<&'static dyn SourceAdapter> {
 /// per-source overrides, and drive each source that should be tracked through
 /// its adapter. Detection is a sentinel `is_dir` check (no history scan); the
 /// full recursive file listing happens only for sources that survive the
-/// override/detection gate. A source that appears after setup is therefore
-/// picked up on the next pass with no re-init.
+/// override/detection gate. `enabled` overrides the sentinel and always
+/// attempts the standard on-disk locations; `auto` follows detection, so a
+/// source that appears after setup is picked up on the next pass with no
+/// re-init.
 pub fn collect_detected(
     store: &Store,
     home: &Path,

@@ -1,4 +1,4 @@
-use aiu::cli::{self, BreakdownKind, Command, SourceModeArg};
+use aiu::cli::{self, BreakdownKind, Command};
 use aiu::paths;
 use aiu::report::{self, breakdown, detail};
 use aiu::store::{SourceMode, Store};
@@ -143,28 +143,16 @@ fn run_sources_detect(json_format: bool) -> Result<(), Box<dyn std::error::Error
 }
 
 fn run_sources_set(
-    mode: SourceModeArg,
+    mode: SourceMode,
     source: &str,
     json_format: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
-    let mode = match mode {
-        SourceModeArg::Auto => SourceMode::Auto,
-        SourceModeArg::Enabled => SourceMode::Enabled,
-        SourceModeArg::Disabled => SourceMode::Disabled,
-    };
     store.set_source_mode(source, mode)?;
     if json_format {
-        print!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "source": source,
-                "mode": mode.as_str(),
-            }))
-            .unwrap_or_else(|_| "{}".to_string())
-        );
+        print!("{}", aiu::sources::render_set_json(source, mode));
     } else {
-        println!("{source}: {}", mode.as_str());
+        print!("{}", aiu::sources::render_set(source, mode));
     }
     Ok(())
 }
