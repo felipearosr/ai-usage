@@ -217,9 +217,11 @@ impl SourceAdapter for ClaudeCodeAdapter {
                 })?;
             let resets_at_utc = match entry.get("resets_at") {
                 None | Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(parse_timestamp(s).ok_or_else(|| {
-                    unrecognized_quota(&format!("window {key:?} has unparsable resets_at"))
-                })?),
+                Some(Value::String(s)) => {
+                    Some(utc::parse_rfc3339_utc_loose(s).ok_or_else(|| {
+                        unrecognized_quota(&format!("window {key:?} has unparsable resets_at"))
+                    })?)
+                }
                 Some(_) => {
                     return Err(unrecognized_quota(&format!(
                         "window {key:?} has non-string resets_at"
@@ -312,7 +314,7 @@ fn parse_usage(record: &serde_json::Map<String, Value>) -> Option<PendingUsage> 
     let usage = message.get("usage")?.as_object()?;
 
     let ts_raw = record.get("timestamp")?.as_str()?;
-    let ts_utc = parse_timestamp(ts_raw)?;
+    let ts_utc = utc::parse_rfc3339_utc_loose(ts_raw)?;
 
     let tokens = |key: &str| -> Option<Option<i64>> {
         match usage.get(key) {
@@ -347,18 +349,4 @@ fn parse_usage(record: &serde_json::Map<String, Value>) -> Option<PendingUsage> 
             .and_then(Value::as_str)
             .map(str::to_string),
     })
-}
-
-/// Parses RFC 3339 UTC timestamps, tolerating fractional seconds
-/// ("2025-06-01T12:00:00.123Z") as written by Claude Code. Returns seconds.
-fn parse_timestamp(raw: &str) -> Option<String> {
-    if let Some(epoch) = utc::parse_rfc3339_utc(raw) {
-        return Some(utc::format_epoch(epoch));
-    }
-    let bytes = raw.as_bytes();
-    if bytes.len() > 20 && bytes[19] == b'.' && *bytes.last()? == b'Z' {
-        let epoch = utc::parse_rfc3339_utc(&format!("{}Z", &raw[..19]))?;
-        return Some(utc::format_epoch(epoch));
-    }
-    None
 }

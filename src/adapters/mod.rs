@@ -7,6 +7,7 @@
 //! decision 2).
 
 pub mod claude;
+pub mod codex;
 
 use std::io::BufRead;
 

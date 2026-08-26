@@ -32,6 +32,22 @@ pub fn format_epoch(secs: u64) -> String {
     )
 }
 
+/// Parses an RFC 3339 UTC timestamp, tolerating trailing fractional seconds
+/// ("2025-06-01T12:00:00.123Z") by truncating them to whole seconds. Used by
+/// source adapters whose upstream writes sub-second precision. Returns the
+/// normalized UTC epoch string, or None when unparsable.
+pub fn parse_rfc3339_utc_loose(raw: &str) -> Option<String> {
+    if let Some(epoch) = parse_rfc3339_utc(raw) {
+        return Some(format_epoch(epoch));
+    }
+    let bytes = raw.as_bytes();
+    if bytes.len() > 20 && bytes[19] == b'.' && *bytes.last()? == b'Z' {
+        let epoch = parse_rfc3339_utc(&format!("{}Z", &raw[..19]))?;
+        return Some(format_epoch(epoch));
+    }
+    None
+}
+
 pub fn parse_rfc3339_utc(s: &str) -> Option<u64> {
     let bytes = s.as_bytes();
     if bytes.len() != 20 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
@@ -139,6 +155,19 @@ mod tests {
         ] {
             assert_eq!(parse_rfc3339_utc(bad), None, "should reject {bad}");
         }
+    }
+
+    #[test]
+    fn loose_parse_tolerates_fractional_seconds() {
+        assert_eq!(
+            parse_rfc3339_utc_loose("2025-06-01T12:00:00.123Z"),
+            Some("2025-06-01T12:00:00Z".to_string())
+        );
+        assert_eq!(
+            parse_rfc3339_utc_loose("2025-06-01T12:00:00Z"),
+            Some("2025-06-01T12:00:00Z".to_string())
+        );
+        assert_eq!(parse_rfc3339_utc_loose("2025-06-01 12:00:00"), None);
     }
 
     #[test]
