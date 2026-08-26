@@ -18,7 +18,15 @@
 //! inflate totals. This adapter therefore emits the *delta* between consecutive
 //! cumulative snapshots (a repeated identical snapshot collapses to nothing)
 //! and attributes each delta to the exact model active at that moment. When
-//! the cumulative counter is absent it falls back to `last_token_usage`.
+//! the cumulative counter is absent it falls back to `last_token_usage`,
+//! collapsing repeated identical fallback values the same way.
+//!
+//! **Scope.** The cumulative baseline is per ingest stream (one rollout file =
+//! one session). Codex resumes append to the same file, so the running total
+//! continues naturally within one stream. A counter that drops mid-stream (a
+//! subagent fork replay) starts a fresh baseline. Reconciling a replayed
+//! prefix against a parent file already imported is the collection/scheduler's
+//! job (it owns adapter position state), not this single-file adapter's.
 //!
 //! **Quota state** rides along on `token_count` events as `payload.rate_limits`
 //! (`primary.used_percent`, `primary.window_minutes`, `primary.resets_at` in
@@ -69,6 +77,226 @@ struct TokenUsage {
     total_tokens: i64,
 }
 
+/// One quota observation from `rate_limits.primary`, used to suppress repeats.
+#[derive(Clone, PartialEq)]
+struct RateLimitObservation {
+    used_percent: f64,
+    resets_at_utc: Option<String>,
+}
+
+/// Mutable parse state for a single ingest pass. Grouping the running session
+/// context and baselines here keeps the per-record helpers small instead of
+/// threading a dozen parameters through them.
+#[derive(Default)]
+struct ParseState {
+    session_id_hash: Option<String>,
+    current_model: Option<String>,
+    tool_version: Option<String>,
+    /// Per-session cumulative baseline, so resumed and interleaved sessions
+    /// each keep their own running total without mixing.
+    baseline: HashMap<String, TokenUsage>,
+    /// Last rate-limit observation emitted per window, so the identical
+    /// observation riding on every token_count does not flood the sink.
+    last_rate_limit: HashMap<String, RateLimitObservation>,
+    /// Last `last_token_usage` fallback value per session, to collapse
+    /// repeated identical snapshots that only differ in timestamp.
+    last_fallback: HashMap<String, TokenUsage>,
+}
+
+impl ParseState {
+    fn begin_session(&mut self, payload: &serde_json::Map<String, Value>) {
+        self.session_id_hash = payload
+            .get("session_id")
+            .or_else(|| payload.get("id"))
+            .and_then(Value::as_str)
+            .map(short_hash_hex);
+        self.tool_version = payload
+            .get("cli_version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        // A new session starts its own model context.
+        self.current_model = None;
+    }
+
+    fn set_model(&mut self, payload: &serde_json::Map<String, Value>) {
+        if let Some(model) = payload.get("model").and_then(Value::as_str) {
+            self.current_model = Some(model.to_string());
+        }
+    }
+
+    fn handle_token_count(
+        &mut self,
+        payload: &serde_json::Map<String, Value>,
+        ts_raw: Option<&str>,
+        ctx: &IngestContext,
+        sink: &mut dyn EventSink,
+        summary: &mut ParseSummary,
+    ) -> Result<()> {
+        if let Some(rate_limits) = payload.get("rate_limits").and_then(Value::as_object) {
+            self.emit_quota_if_changed(rate_limits, ctx, sink, summary)?;
+        }
+
+        // `info` can be null on the very first emission of a session.
+        let Some(info) = payload.get("info").and_then(Value::as_object) else {
+            return Ok(());
+        };
+
+        let Some(model) = self.current_model.as_deref() else {
+            // Honest accounting needs an exact model; a token_count without any
+            // turn_context hint cannot be attributed and is skipped (never
+            // guessed, per the null discipline).
+            summary.malformed_skipped += 1;
+            return Ok(());
+        };
+        let Some(session) = self.session_id_hash.as_deref() else {
+            summary.malformed_skipped += 1;
+            return Ok(());
+        };
+        let Some(ts_utc) = ts_raw.and_then(utc::parse_rfc3339_utc_loose) else {
+            summary.malformed_skipped += 1;
+            return Ok(());
+        };
+
+        if let Some(cum) = info.get("total_token_usage").and_then(Value::as_object) {
+            let Some(cur) = parse_usage(cum) else {
+                summary.malformed_skipped += 1;
+                return Ok(());
+            };
+            let key = session.to_string();
+            let prev = self.baseline.get(&key).copied();
+            let delta = match prev {
+                None => cur,
+                Some(p) if cur == p => {
+                    summary.duplicates_skipped += 1;
+                    return Ok(());
+                }
+                // Counter reset (subagent fork replay): fresh baseline.
+                Some(p) if cur.total_tokens < p.total_tokens => cur,
+                Some(p) => TokenUsage {
+                    input_tokens: cur.input_tokens - p.input_tokens,
+                    cached_input_tokens: cur.cached_input_tokens - p.cached_input_tokens,
+                    output_tokens: cur.output_tokens - p.output_tokens,
+                    reasoning_output_tokens: cur.reasoning_output_tokens
+                        - p.reasoning_output_tokens,
+                    total_tokens: cur.total_tokens - p.total_tokens,
+                },
+            };
+            self.baseline.insert(key, cur);
+            if delta.total_tokens <= 0 {
+                return Ok(());
+            }
+            let anchor = format!(
+                "cum:{}:{}:{}:{}:{}",
+                cur.input_tokens,
+                cur.cached_input_tokens,
+                cur.output_tokens,
+                cur.reasoning_output_tokens,
+                cur.total_tokens
+            );
+            emit_event(
+                sink,
+                ctx,
+                session,
+                model,
+                &ts_utc,
+                &delta,
+                &anchor,
+                self.tool_version.as_deref(),
+            )?;
+            summary.events_emitted += 1;
+        } else if let Some(last) = info.get("last_token_usage").and_then(Value::as_object) {
+            let Some(delta) = parse_usage(last) else {
+                summary.malformed_skipped += 1;
+                return Ok(());
+            };
+            if delta.total_tokens <= 0 {
+                return Ok(());
+            }
+            // A repeated identical fallback value is a streaming replacement,
+            // not new usage.
+            if self.last_fallback.get(session) == Some(&delta) {
+                summary.duplicates_skipped += 1;
+                return Ok(());
+            }
+            self.last_fallback.insert(session.to_string(), delta);
+            let anchor = format!(
+                "last:{}:{}:{}:{}:{}:{}",
+                ts_utc,
+                delta.input_tokens,
+                delta.cached_input_tokens,
+                delta.output_tokens,
+                delta.reasoning_output_tokens,
+                delta.total_tokens
+            );
+            emit_event(
+                sink,
+                ctx,
+                session,
+                model,
+                &ts_utc,
+                &delta,
+                &anchor,
+                self.tool_version.as_deref(),
+            )?;
+            summary.events_emitted += 1;
+        }
+
+        Ok(())
+    }
+
+    /// Emits a quota snapshot when the rate-limit observation changed since
+    /// the last one for that window; unchanged observations are dropped so
+    /// snapshot history stays sparse.
+    fn emit_quota_if_changed(
+        &mut self,
+        rate_limits: &serde_json::Map<String, Value>,
+        ctx: &IngestContext,
+        sink: &mut dyn EventSink,
+        summary: &mut ParseSummary,
+    ) -> Result<()> {
+        let Some(primary) = rate_limits.get("primary").and_then(Value::as_object) else {
+            return Ok(());
+        };
+        // Unknown window lengths are skipped, never mapped to a guessed window.
+        let Some(window) = primary
+            .get("window_minutes")
+            .and_then(Value::as_i64)
+            .and_then(map_window)
+        else {
+            return Ok(());
+        };
+        let Some(used_percent) = primary.get("used_percent").and_then(Value::as_f64) else {
+            return Ok(());
+        };
+        let resets_at_utc = match primary.get("resets_at").and_then(Value::as_i64) {
+            Some(epoch) if epoch > 0 => Some(utc::format_epoch(epoch as u64)),
+            _ => None,
+        };
+
+        let observation = RateLimitObservation {
+            used_percent,
+            resets_at_utc: resets_at_utc.clone(),
+        };
+        if self.last_rate_limit.get(window) == Some(&observation) {
+            return Ok(());
+        }
+        self.last_rate_limit.insert(window.to_string(), observation);
+
+        let stored = sink.accept_snapshot(NewSnapshot {
+            source: SOURCE.to_string(),
+            window: window.to_string(),
+            used_percent,
+            resets_at_utc,
+            observed_at_utc: utc::format_epoch(ctx.now_epoch),
+            observing_device_id: ctx.device_id.clone(),
+        })?;
+        if stored {
+            summary.snapshots_emitted += 1;
+        }
+        Ok(())
+    }
+}
+
 impl SourceAdapter for CodexAdapter {
     fn source(&self) -> &'static str {
         SOURCE
@@ -86,17 +314,8 @@ impl SourceAdapter for CodexAdapter {
         progress: &mut ProgressFn<'_>,
     ) -> Result<ParseSummary> {
         let mut summary = ParseSummary::default();
+        let mut state = ParseState::default();
         let mut recognized_any = false;
-
-        let mut session_id_hash: Option<String> = None;
-        let mut current_model: Option<String> = None;
-        let mut tool_version: Option<String> = None;
-        // Per-session cumulative baseline, so resumed and interleaved
-        // sessions each keep their own running total without mixing.
-        let mut baseline: HashMap<String, TokenUsage> = HashMap::new();
-        // Last rate-limit observation emitted per window, so the identical
-        // observation riding on every token_count does not flood the sink.
-        let mut last_rate_limit: HashMap<String, (f64, Option<String>)> = HashMap::new();
 
         let mut lines_seen = 0u64;
         for line in input.lines() {
@@ -140,41 +359,14 @@ impl SourceAdapter for CodexAdapter {
             };
 
             match record_type {
-                "session_meta" => {
-                    session_id_hash = payload
-                        .get("session_id")
-                        .or_else(|| payload.get("id"))
-                        .and_then(Value::as_str)
-                        .map(short_hash_hex);
-                    tool_version = payload
-                        .get("cli_version")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    // A new session starts its own model context.
-                    current_model = None;
-                }
-                "turn_context" => {
-                    if let Some(model) = payload.get("model").and_then(Value::as_str) {
-                        current_model = Some(model.to_string());
-                    }
-                }
+                "session_meta" => state.begin_session(payload),
+                "turn_context" => state.set_model(payload),
                 "event_msg" => {
                     if payload.get("type").and_then(Value::as_str) != Some("token_count") {
                         continue;
                     }
                     let ts_raw = obj.get("timestamp").and_then(Value::as_str);
-                    handle_token_count(
-                        payload,
-                        ts_raw,
-                        ctx,
-                        sink,
-                        &mut summary,
-                        session_id_hash.as_deref(),
-                        &current_model,
-                        tool_version.as_deref(),
-                        &mut baseline,
-                        &mut last_rate_limit,
-                    )?;
+                    state.handle_token_count(payload, ts_raw, ctx, sink, &mut summary)?;
                 }
                 "response_item" => { /* content only, never read */ }
                 _ => unreachable!(),
@@ -195,108 +387,6 @@ impl SourceAdapter for CodexAdapter {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_token_count(
-    payload: &serde_json::Map<String, Value>,
-    ts_raw: Option<&str>,
-    ctx: &IngestContext,
-    sink: &mut dyn EventSink,
-    summary: &mut ParseSummary,
-    session_id_hash: Option<&str>,
-    current_model: &Option<String>,
-    tool_version: Option<&str>,
-    baseline: &mut HashMap<String, TokenUsage>,
-    last_rate_limit: &mut HashMap<String, (f64, Option<String>)>,
-) -> Result<()> {
-    if let Some(rate_limits) = payload.get("rate_limits").and_then(Value::as_object) {
-        emit_quota_if_changed(rate_limits, ctx, sink, summary, last_rate_limit)?;
-    }
-
-    // `info` can be null on the very first emission of a session.
-    let Some(info) = payload.get("info").and_then(Value::as_object) else {
-        return Ok(());
-    };
-
-    let Some(model) = current_model.as_deref() else {
-        // Honest accounting needs an exact model; a token_count without any
-        // turn_context hint cannot be attributed and is skipped (never
-        // guessed, per the null discipline).
-        summary.malformed_skipped += 1;
-        return Ok(());
-    };
-    let Some(session) = session_id_hash else {
-        summary.malformed_skipped += 1;
-        return Ok(());
-    };
-    let Some(ts_utc) = ts_raw.and_then(utc::parse_rfc3339_utc_loose) else {
-        summary.malformed_skipped += 1;
-        return Ok(());
-    };
-
-    if let Some(cum) = info.get("total_token_usage").and_then(Value::as_object) {
-        let Some(cur) = parse_usage(cum) else {
-            summary.malformed_skipped += 1;
-            return Ok(());
-        };
-        let key = session.to_string();
-        let prev = baseline.get(&key).copied();
-        let delta = match prev {
-            None => cur,
-            Some(p) if cur == p => {
-                summary.duplicates_skipped += 1;
-                return Ok(());
-            }
-            // Counter reset (subagent fork replay): treat as a fresh baseline.
-            Some(p) if cur.total_tokens < p.total_tokens => cur,
-            Some(p) => TokenUsage {
-                input_tokens: cur.input_tokens - p.input_tokens,
-                cached_input_tokens: cur.cached_input_tokens - p.cached_input_tokens,
-                output_tokens: cur.output_tokens - p.output_tokens,
-                reasoning_output_tokens: cur.reasoning_output_tokens - p.reasoning_output_tokens,
-                total_tokens: cur.total_tokens - p.total_tokens,
-            },
-        };
-        baseline.insert(key, cur);
-        if delta.total_tokens <= 0 {
-            return Ok(());
-        }
-        emit_event(
-            sink,
-            ctx,
-            session,
-            model,
-            &ts_utc,
-            &delta,
-            &cur,
-            tool_version,
-            false,
-        )?;
-        summary.events_emitted += 1;
-    } else if let Some(last) = info.get("last_token_usage").and_then(Value::as_object) {
-        let Some(delta) = parse_usage(last) else {
-            summary.malformed_skipped += 1;
-            return Ok(());
-        };
-        if delta.total_tokens <= 0 {
-            return Ok(());
-        }
-        emit_event(
-            sink,
-            ctx,
-            session,
-            model,
-            &ts_utc,
-            &delta,
-            &delta,
-            tool_version,
-            true,
-        )?;
-        summary.events_emitted += 1;
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn emit_event(
     sink: &mut dyn EventSink,
     ctx: &IngestContext,
@@ -304,34 +394,12 @@ fn emit_event(
     model: &str,
     ts_utc: &str,
     delta: &TokenUsage,
-    cumulative: &TokenUsage,
+    anchor: &str,
     tool_version: Option<&str>,
-    fallback: bool,
 ) -> Result<()> {
-    // Deterministic identity. Cumulative mode anchors on the monotonic running
-    // total; the fallback anchors on the timestamp + values. Either way
-    // re-ingesting the same file produces the same ids, so import never
-    // double-counts.
-    let anchor = if fallback {
-        format!(
-            "last:{}:{}:{}:{}:{}:{}",
-            ts_utc,
-            delta.input_tokens,
-            delta.cached_input_tokens,
-            delta.output_tokens,
-            delta.reasoning_output_tokens,
-            delta.total_tokens
-        )
-    } else {
-        format!(
-            "cum:{}:{}:{}:{}:{}",
-            cumulative.input_tokens,
-            cumulative.cached_input_tokens,
-            cumulative.output_tokens,
-            cumulative.reasoning_output_tokens,
-            cumulative.total_tokens
-        )
-    };
+    // Deterministic identity: cumulative mode anchors on the monotonic running
+    // total, the fallback on the timestamp + values. Either way re-ingesting
+    // the same file produces the same ids, so import never double-counts.
     let joined = format!(
         "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         SOURCE, ctx.device_id, session_id_hash, model, anchor
@@ -359,59 +427,13 @@ fn emit_event(
     Ok(())
 }
 
-/// Emits a quota snapshot when the rate-limit observation changed since the
-/// last one for that window. Unchanged observations riding on later events
-/// are dropped so the snapshot history stays sparse.
-fn emit_quota_if_changed(
-    rate_limits: &serde_json::Map<String, Value>,
-    ctx: &IngestContext,
-    sink: &mut dyn EventSink,
-    summary: &mut ParseSummary,
-    last: &mut HashMap<String, (f64, Option<String>)>,
-) -> Result<()> {
-    let Some(primary) = rate_limits.get("primary").and_then(Value::as_object) else {
-        return Ok(());
-    };
-    // Unknown window lengths are skipped, never mapped to a guessed window.
-    let Some(window) = primary
-        .get("window_minutes")
-        .and_then(Value::as_i64)
-        .and_then(map_window)
-    else {
-        return Ok(());
-    };
-    let Some(used_percent) = primary.get("used_percent").and_then(Value::as_f64) else {
-        return Ok(());
-    };
-    let resets_at_utc = match primary.get("resets_at").and_then(Value::as_i64) {
-        Some(epoch) if epoch > 0 => Some(utc::format_epoch(epoch as u64)),
-        _ => None,
-    };
-
-    if last.get(window) == Some(&(used_percent, resets_at_utc.clone())) {
-        return Ok(());
-    }
-    last.insert(window.to_string(), (used_percent, resets_at_utc.clone()));
-
-    let stored = sink.accept_snapshot(NewSnapshot {
-        source: SOURCE.to_string(),
-        window: window.to_string(),
-        used_percent,
-        resets_at_utc,
-        observed_at_utc: utc::format_epoch(ctx.now_epoch),
-        observing_device_id: ctx.device_id.clone(),
-    })?;
-    if stored {
-        summary.snapshots_emitted += 1;
-    }
-    Ok(())
-}
-
+/// Maps a Codex rate-limit window length (minutes) to aiu's window name.
+/// Codex provides 5-hour and weekly subscription windows; lengths that do not
+/// match are skipped rather than guessed.
 fn map_window(window_minutes: i64) -> Option<&'static str> {
     match window_minutes {
         300 => Some("5h"),
         10_080 => Some("week"),
-        43_200 => Some("month"),
         _ => None,
     }
 }

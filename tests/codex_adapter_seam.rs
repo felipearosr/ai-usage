@@ -330,6 +330,57 @@ fn last_token_usage_fallback_emits_the_turn_delta_directly() {
 }
 
 #[test]
+fn repeated_identical_fallback_values_are_collapsed() {
+    let fallback = |ts: &str| {
+        format!(
+            "{{\"timestamp\":\"{ts}\",\"type\":\"event_msg\",\
+              \"payload\":{{\"type\":\"token_count\",\"info\":{{\"last_token_usage\":\
+              {{\"input_tokens\":80,\"cached_input_tokens\":10,\"output_tokens\":30,\
+              \"reasoning_output_tokens\":0,\"total_tokens\":110}}}}}}}}"
+        )
+    };
+    let fixture = [
+        session_meta("sess-1", "0.130.0"),
+        turn_context("gpt-5-codex", "turn-1"),
+        fallback("2023-11-25T11:00:00.000Z"),
+        fallback("2023-11-25T11:00:01.000Z"),
+    ]
+    .join("\n");
+
+    let (summary, out) = ingest(&fixture);
+    assert_eq!(out.events.len(), 1);
+    assert_eq!(summary.duplicates_skipped, 1);
+}
+
+#[test]
+fn resumed_session_continues_the_running_total_across_non_token_events() {
+    // A resume appends to the same rollout; interleaved non-token events must
+    // not disturb the carried cumulative baseline.
+    let fixture = [
+        session_meta("sess-1", "0.130.0"),
+        turn_context("gpt-5-codex", "turn-1"),
+        token_count("2023-11-25T11:00:00.000Z", &usage(100, 0, 40, 0, 140)),
+        "{\"timestamp\":\"2023-11-25T11:00:02.000Z\",\"type\":\"event_msg\",\
+          \"payload\":{\"type\":\"agent_message\",\"message\":\"thinking…\"}}"
+            .to_string(),
+        "{\"timestamp\":\"2023-11-25T11:00:03.000Z\",\"type\":\"response_item\",\
+          \"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}"
+            .to_string(),
+        token_count("2023-11-25T12:00:00.000Z", &usage(300, 0, 120, 0, 500)),
+    ]
+    .join("\n");
+
+    let (summary, out) = ingest(&fixture);
+    assert_eq!(out.events.len(), 2);
+    assert_eq!(
+        out.events[1].output_tokens,
+        Some(80),
+        "delta over the carried total, not the full 120"
+    );
+    assert_eq!(summary.duplicates_skipped, 0);
+}
+
+#[test]
 fn null_info_is_skipped_without_error() {
     let fixture = [
         session_meta("sess-1", "0.130.0"),
