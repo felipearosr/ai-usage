@@ -33,11 +33,13 @@ pub struct NewEvent {
     pub exact_model: String,
     pub session_id_hash: Option<String>,
     pub ts_utc: String,
-    pub input_tokens: i64,
-    pub cached_input_tokens: i64,
-    pub cache_write_tokens: i64,
-    pub output_tokens: i64,
-    pub reasoning_tokens: i64,
+    /// Token counts are `None` when the source did not report the class:
+    /// unknown stays null, never guessed as zero (spec normalization rules).
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+    pub reasoning_tokens: Option<i64>,
     pub reported_cost_micros: Option<i64>,
     pub tool_version: Option<String>,
     pub adapter_version: Option<String>,
@@ -154,6 +156,62 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Records a quota snapshot unless it is byte-identical to the latest
+    /// observation for the same source/window. Re-running collection or
+    /// import therefore does not grow snapshot history with no-op rows.
+    /// Returns true when a new observation was stored.
+    pub fn record_snapshot_if_changed(&self, s: &NewSnapshot) -> Result<bool> {
+        let latest = self.conn.query_row(
+            "SELECT used_percent, resets_at_utc FROM quota_snapshots
+             WHERE source = ?1 AND window = ?2
+             ORDER BY observed_at_utc DESC, id DESC LIMIT 1",
+            rusqlite::params![s.source, s.window],
+            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Option<String>>(1)?)),
+        );
+        let changed = match latest {
+            Ok((percent, resets)) => !(percent == s.used_percent && resets == s.resets_at_utc),
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(e) => return Err(e.into()),
+        };
+        if changed {
+            self.record_snapshot(s)?;
+        }
+        Ok(changed)
+    }
+
+    /// Explicit transaction for batching many writes into periodic commits.
+    /// Rolls back on drop unless committed.
+    pub fn transaction(&self) -> Result<rusqlite::Transaction<'_>> {
+        Ok(self.conn.unchecked_transaction()?)
+    }
+
+    /// Records an adapter diagnostic (e.g. unrecognized upstream format) in
+    /// the local database so failures stay visible after the process exits.
+    /// Newest diagnostic per key wins; history beyond that is not kept.
+    pub fn record_diagnostic(&self, key: &str, detail: &str, ts_utc: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO metadata (key, value)
+             VALUES ('diagnostic:' || ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, format!("{ts_utc} {detail}")],
+        )?;
+        Ok(())
+    }
+
+    /// Returns the most recent diagnostic recorded for `source`, if any.
+    pub fn diagnostic_for(&self, source: &str) -> Result<Option<String>> {
+        let value = self.conn.query_row(
+            "SELECT value FROM metadata WHERE key = 'diagnostic:' || ?1",
+            rusqlite::params![source],
+            |row| row.get::<_, String>(0),
+        );
+        match value {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
