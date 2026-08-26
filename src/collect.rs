@@ -10,7 +10,7 @@
 //! inherited from the import machinery's deterministic event identities.
 
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::adapters::{IngestContext, SourceAdapter};
 use crate::error::{AiuError, Result};
@@ -100,6 +100,41 @@ pub fn adapter_for(source: &str) -> Option<&'static dyn SourceAdapter> {
         "codex" => Some(&crate::adapters::codex::CodexAdapter),
         _ => None,
     }
+}
+
+/// The periodic cheap collection pass: detect which sources are present, apply
+/// per-source overrides, and drive each source that should be tracked through
+/// its adapter. Detection is a sentinel `is_dir` check (no history scan); the
+/// full recursive file listing happens only for sources that survive the
+/// override/detection gate. A source that appears after setup is therefore
+/// picked up on the next pass with no re-init.
+pub fn collect_detected(
+    store: &Store,
+    home: &Path,
+    ctx: &IngestContext,
+) -> Result<Vec<SourceCollect>> {
+    let mut results = Vec::new();
+    for detection in crate::sources::detect(home) {
+        let mode = store.source_mode(detection.source)?;
+        if !crate::sources::should_collect(mode, detection.detected) {
+            continue;
+        }
+        let Some(adapter) = adapter_for(detection.source) else {
+            continue;
+        };
+        let files = crate::discover::files_for(home, detection.source);
+        if files.is_empty() {
+            continue;
+        }
+        results.push(collect_source(
+            store,
+            adapter,
+            &files,
+            ctx,
+            ImportOptions::default(),
+        )?);
+    }
+    Ok(results)
 }
 
 #[cfg(test)]

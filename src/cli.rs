@@ -3,7 +3,9 @@
 //! Surface: `aiu` renders the compact overview report, `aiu <source>` renders
 //! a per-source detail view, `aiu <source> models` the machine × exact-model
 //! matrix, `aiu <source> machines` machine shares plus per-machine models;
-//! `--json` switches any of them to JSON.
+//! `aiu sources` lists detection + overrides, with `detect` and
+//! `enable|disable|auto <source>` subcommands. `--json` switches any of them
+//! to JSON.
 
 use std::fmt;
 
@@ -21,6 +23,17 @@ pub enum Command {
         kind: BreakdownKind,
         json: bool,
     },
+    Sources {
+        json: bool,
+    },
+    SourcesDetect {
+        json: bool,
+    },
+    SourcesSet {
+        mode: SourceModeArg,
+        source: String,
+        json: bool,
+    },
     Help,
     Version,
 }
@@ -29,6 +42,14 @@ pub enum Command {
 pub enum BreakdownKind {
     Models,
     Machines,
+}
+
+/// The override target for `aiu sources enable|disable|auto <source>`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SourceModeArg {
+    Auto,
+    Enabled,
+    Disabled,
 }
 
 #[derive(Debug)]
@@ -50,6 +71,9 @@ USAGE:
     aiu <source> [--json]           per-source detail view (quota + attribution)
     aiu <source> models [--json]    machine × exact-model matrix per window
     aiu <source> machines [--json]  machine shares + per-machine model list
+    aiu sources [--json]            list detection + per-source overrides
+    aiu sources detect [--json]     re-run source detection
+    aiu sources <mode> <source>     enable | disable | auto a source
 
 SOURCES:
     claude    Claude Code
@@ -66,6 +90,15 @@ const SOURCES: [&str; 3] = ["claude", "codex", "go"];
 
 fn is_source(name: &str) -> bool {
     SOURCES.contains(&name)
+}
+
+fn mode_arg(word: &str) -> Option<SourceModeArg> {
+    match word {
+        "auto" => Some(SourceModeArg::Auto),
+        "enable" => Some(SourceModeArg::Enabled),
+        "disable" => Some(SourceModeArg::Disabled),
+        _ => None,
+    }
 }
 
 pub fn parse<I>(args: I) -> Result<Command, ArgsError>
@@ -89,6 +122,23 @@ where
 
     match positionals.as_slice() {
         [] => Ok(Command::Report { json }),
+        [s] if s == "sources" => Ok(Command::Sources { json }),
+        [s, sub] if s == "sources" && sub == "detect" => Ok(Command::SourcesDetect { json }),
+        [s, mode, source] if s == "sources" && is_source(source) => {
+            match mode_arg(mode) {
+                Some(mode) => Ok(Command::SourcesSet {
+                    mode,
+                    source: source.clone(),
+                    json,
+                }),
+                None => Err(ArgsError(format!(
+                    "unknown sources command: {mode}\navailable: detect, enable, disable, auto\n\n{USAGE}"
+                ))),
+            }
+        }
+        [s, ..] if s == "sources" => Err(ArgsError(format!(
+            "unknown sources command\navailable: detect, enable <source>, disable <source>, auto <source>\n\n{USAGE}"
+        ))),
         [source] if is_source(source) => Ok(Command::Detail {
             source: source.clone(),
             json,
@@ -237,5 +287,51 @@ mod tests {
     fn breakdown_rejects_unknown_subcommand() {
         assert!(parse(args(&["claude", "frobnicate"])).is_err());
         assert!(parse(args(&["claude", "models", "extra"])).is_err());
+    }
+
+    #[test]
+    fn sources_commands_parse() {
+        assert_eq!(
+            parse(args(&["sources"])).unwrap(),
+            Command::Sources { json: false }
+        );
+        assert_eq!(
+            parse(args(&["sources", "--json"])).unwrap(),
+            Command::Sources { json: true }
+        );
+        assert_eq!(
+            parse(args(&["sources", "detect"])).unwrap(),
+            Command::SourcesDetect { json: false }
+        );
+        for (word, mode) in [
+            ("enable", SourceModeArg::Enabled),
+            ("disable", SourceModeArg::Disabled),
+            ("auto", SourceModeArg::Auto),
+        ] {
+            for source in SOURCES {
+                assert_eq!(
+                    parse(args(&["sources", word, source])).unwrap(),
+                    Command::SourcesSet {
+                        mode,
+                        source: source.to_string(),
+                        json: false,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sources_rejects_bad_arguments() {
+        assert!(parse(args(&["sources", "frobnicate"])).is_err());
+        assert!(
+            parse(args(&["sources", "enable"])).is_err(),
+            "missing source"
+        );
+        assert!(
+            parse(args(&["sources", "enable", "wat"])).is_err(),
+            "unknown source"
+        );
+        assert!(parse(args(&["sources", "detect", "extra"])).is_err());
     }
 }

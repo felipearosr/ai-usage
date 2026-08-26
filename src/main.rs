@@ -1,7 +1,7 @@
-use aiu::cli::{self, BreakdownKind, Command};
+use aiu::cli::{self, BreakdownKind, Command, SourceModeArg};
 use aiu::paths;
 use aiu::report::{self, breakdown, detail};
-use aiu::store::Store;
+use aiu::store::{SourceMode, Store};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -23,6 +23,21 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Sources { json }) => {
+            if let Err(e) = run_sources(json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::SourcesDetect { json }) => {
+            if let Err(e) = run_sources_detect(json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::SourcesSet { mode, source, json }) => {
+            if let Err(e) = run_sources_set(mode, &source, json) {
+                die(1, e);
+            }
+        }
         Err(e) => die(2, e),
     }
 }
@@ -38,9 +53,9 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 }
 
 /// A quick local refresh before rendering: mint the machine identity once,
-/// discover local source files, and stream their deltas into the store. A
-/// broken source is contained — the report still renders from whatever is
-/// already (and newly) persisted.
+/// cheaply detect which sources are present, apply overrides, and stream the
+/// surviving sources' deltas into the store. A broken source is contained —
+/// the report still renders from whatever is already (and newly) persisted.
 fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
     let identity = aiu::identity::ensure_local_identity(store)?;
     let Some(home) = paths::home_dir() else {
@@ -53,22 +68,7 @@ fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
         now_epoch: now,
     };
 
-    for discovered in aiu::discover::discover(&home) {
-        let Some(adapter) = aiu::collect::adapter_for(discovered.source) else {
-            continue;
-        };
-        if discovered.files.is_empty() {
-            continue;
-        }
-        // Source-level containment: a failing source never aborts the report.
-        aiu::collect::collect_source(
-            store,
-            adapter,
-            &discovered.files,
-            &ctx,
-            aiu::import::ImportOptions::default(),
-        )?;
-    }
+    aiu::collect::collect_detected(store, &home, &ctx)?;
     Ok(())
 }
 
@@ -111,6 +111,60 @@ fn run_breakdown(
         (BreakdownKind::Machines, false) => {
             print!("{}", breakdown::text::render_machines(&breakdown))
         }
+    }
+    Ok(())
+}
+
+fn run_sources(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let Some(home) = paths::home_dir() else {
+        return Err(Box::new(aiu::error::AiuError::NoDataDir));
+    };
+    let statuses = aiu::sources::statuses(&store, &home)?;
+    if json_format {
+        print!("{}", aiu::sources::render_statuses_json(&statuses));
+    } else {
+        print!("{}", aiu::sources::render_statuses(&statuses));
+    }
+    Ok(())
+}
+
+fn run_sources_detect(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(home) = paths::home_dir() else {
+        return Err(Box::new(aiu::error::AiuError::NoDataDir));
+    };
+    let detections = aiu::sources::detect(&home);
+    if json_format {
+        print!("{}", aiu::sources::render_detections_json(&detections));
+    } else {
+        print!("{}", aiu::sources::render_detections(&detections));
+    }
+    Ok(())
+}
+
+fn run_sources_set(
+    mode: SourceModeArg,
+    source: &str,
+    json_format: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let mode = match mode {
+        SourceModeArg::Auto => SourceMode::Auto,
+        SourceModeArg::Enabled => SourceMode::Enabled,
+        SourceModeArg::Disabled => SourceMode::Disabled,
+    };
+    store.set_source_mode(source, mode)?;
+    if json_format {
+        print!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "source": source,
+                "mode": mode.as_str(),
+            }))
+            .unwrap_or_else(|_| "{}".to_string())
+        );
+    } else {
+        println!("{source}: {}", mode.as_str());
     }
     Ok(())
 }

@@ -1,10 +1,9 @@
 //! Local source-file discovery.
 //!
 //! Finds the on-disk persistence each source leaves behind, so collection can
-//! read new records without a resident daemon. Discovery is a cheap listing
-//! (no full rescans); the source-detection/override logic that decides *which*
-//! sources to track lives in issue 07 — here we just locate files for the
-//! sources aiu already knows about.
+//! read new records without a resident daemon. This is the full recursive
+//! file listing, gated by the cheap source detection in [`crate::sources`]
+//! (issue 07) so absent sources never trigger a scan.
 //!
 //! Claude Code: `~/.claude/projects/**/*.jsonl` (session transcripts).
 //! Codex: `~/.codex/sessions/**/rollout-*.jsonl` (rollout files).
@@ -23,21 +22,25 @@ pub fn discover(home: &Path) -> Vec<DiscoveredSource> {
     vec![
         DiscoveredSource {
             source: "claude",
-            files: claude_files(home),
+            files: files_for(home, "claude"),
         },
         DiscoveredSource {
             source: "codex",
-            files: codex_files(home),
+            files: files_for(home, "codex"),
         },
     ]
 }
 
-fn claude_files(home: &Path) -> Vec<PathBuf> {
-    collect_jsonl(&home.join(".claude/projects"), None)
-}
-
-fn codex_files(home: &Path) -> Vec<PathBuf> {
-    collect_jsonl(&home.join(".codex/sessions"), Some("rollout-"))
+/// The on-disk data files for one source. A full recursive listing, so it is
+/// only run for sources that should actually be collected (issue 07 detection
+/// gates this); sources without a file listing yet (e.g. `go`, issue 04) yield
+/// an empty list.
+pub fn files_for(home: &Path, source: &str) -> Vec<PathBuf> {
+    match source {
+        "claude" => collect_jsonl(&home.join(".claude/projects"), None),
+        "codex" => collect_jsonl(&home.join(".codex/sessions"), Some("rollout-")),
+        _ => Vec::new(),
+    }
 }
 
 /// Recursively collects `.jsonl` files under `dir`, optionally restricted to a
