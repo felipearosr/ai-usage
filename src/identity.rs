@@ -23,26 +23,22 @@ pub struct LocalIdentity {
 /// Returns the persisted identity, minting it once when absent. Idempotent:
 /// a second call returns the exact same ids and creates no duplicates.
 pub fn ensure_local_identity(store: &Store) -> Result<LocalIdentity> {
-    let device_id = match store.get_metadata("device_id")? {
-        Some(existing) => existing,
-        None => {
-            let fresh = random_hex(16)?;
-            store.set_metadata("device_id", &fresh)?;
-            fresh
-        }
-    };
-    let workspace_id = match store.get_metadata("workspace_id")? {
-        Some(existing) => existing,
-        None => {
-            let fresh = random_hex(16)?;
-            store.set_metadata("workspace_id", &fresh)?;
-            fresh
-        }
-    };
+    let device_id = get_or_mint(store, "device_id")?;
+    let workspace_id = get_or_mint(store, "workspace_id")?;
     Ok(LocalIdentity {
         device_id,
         workspace_id,
     })
+}
+
+/// Reads a metadata key, minting and persisting a random value when absent.
+fn get_or_mint(store: &Store, key: &str) -> Result<String> {
+    if let Some(existing) = store.get_metadata(key)? {
+        return Ok(existing);
+    }
+    let fresh = random_hex(16)?;
+    store.set_metadata(key, &fresh)?;
+    Ok(fresh)
 }
 
 /// Reads `bytes` random bytes from the OS CSPRNG and hex-encodes them.

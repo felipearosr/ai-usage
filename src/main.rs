@@ -38,7 +38,7 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 /// already (and newly) persisted.
 fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
     let identity = aiu::identity::ensure_local_identity(store)?;
-    let Some(home) = paths::home() else {
+    let Some(home) = paths::home_dir() else {
         return Ok(());
     };
     let now = aiu::utc::now_epoch();
