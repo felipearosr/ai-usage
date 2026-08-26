@@ -5,7 +5,7 @@ use crate::utc;
 
 pub fn render(report: &Report) -> String {
     let mut out = String::new();
-    out.push_str("aiu\n\n");
+    out.push_str("AI USAGE\n\n");
 
     if report.sources.is_empty() && report.devices.is_empty() {
         out.push_str("No usage recorded yet.\n");
@@ -19,7 +19,7 @@ pub fn render(report: &Report) -> String {
     }
 
     if !report.devices.is_empty() {
-        out.push_str("devices\n");
+        out.push_str("SYNC\n");
         for device in &report.devices {
             let age = device.age_secs(report.generated_at_epoch);
             let detail = match age {
@@ -63,18 +63,19 @@ fn render_source(out: &mut String, source: &crate::report::SourceReport, now: u6
         out.push_str("  quota     no vendor snapshot yet\n");
     }
 
-    if let Some(model) = &source.top_model {
-        out.push_str(&format!(
-            "  top model    {} ({} out tok, all-time)\n",
-            model.name,
-            humanize_tokens(model.output_tokens)
-        ));
-    }
+    // A "top" line per source: participating machine first, then exact model.
     if let Some(machine) = &source.top_machine {
         out.push_str(&format!(
             "  top machine  {} ({} out tok, all-time)\n",
             machine.name,
             humanize_tokens(machine.output_tokens)
+        ));
+    }
+    if let Some(model) = &source.top_model {
+        out.push_str(&format!(
+            "  top model    {} ({} out tok, all-time)\n",
+            model.name,
+            humanize_tokens(model.output_tokens)
         ));
     }
 }

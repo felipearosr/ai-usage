@@ -66,7 +66,7 @@ fn empty_store_renders_the_empty_state_report() {
     let report = report::build(&store, NOW).unwrap();
 
     let out = text::render(&report);
-    assert!(out.contains("aiu"));
+    assert!(out.contains("AI USAGE"));
     assert!(out.contains("No usage recorded yet."));
     assert!(out.contains("aiu init"));
 
@@ -243,6 +243,156 @@ fn latest_snapshot_per_window_wins() {
     let out = text::render(&report);
     assert!(out.contains("55.5% used"));
     assert!(!out.contains("10.0% used"));
+}
+
+// ---- Compact default command (issue 05) -----------------------------------
+
+/// Extracts the text block belonging to one source, from its header line to
+/// the next blank line, so per-source assertions stay scoped.
+fn block<'a>(out: &'a str, source: &str) -> &'a str {
+    let start = out.find(source).expect("source block present");
+    let rest = &out[start..];
+    match rest.find("\n\n") {
+        Some(end) => &rest[..end],
+        None => rest,
+    }
+}
+
+#[test]
+fn compact_layout_has_ai_usage_header_top_lines_and_sync_section() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    snapshot(&store, "claude", "5h", 42.5, Some(4440));
+    event(
+        &store,
+        "e1",
+        "dev-laptop",
+        "claude",
+        "claude-opus-5",
+        12_000,
+    );
+
+    let report = report::build(&store, NOW).unwrap();
+    let out = text::render(&report);
+
+    assert!(
+        out.starts_with("AI USAGE\n"),
+        "header leads the report: {out}"
+    );
+    assert!(out.contains("\nSYNC\n"), "sync section header: {out}");
+    assert!(out.contains("laptop"));
+    assert!(out.contains("synced 2m ago"));
+    assert!(out.contains("top machine  laptop"));
+    assert!(out.contains("top model    claude-opus-5"));
+}
+
+#[test]
+fn never_synced_device_renders_as_unsynced_not_stale() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", None);
+    snapshot(&store, "claude", "5h", 10.0, None);
+    event(&store, "e1", "dev-laptop", "claude", "claude-opus-5", 5);
+
+    let report = report::build(&store, NOW).unwrap();
+    let out = text::render(&report);
+    assert!(out.contains("never synced"), "{out}");
+    assert!(!out.contains("STALE"), "never synced is not stale: {out}");
+
+    let doc: serde_json::Value = serde_json::from_str(&report::json::render(&report)).unwrap();
+    let laptop = doc["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == "laptop")
+        .unwrap();
+    assert_eq!(laptop["stale"], false);
+}
+
+#[test]
+fn three_sources_render_three_independent_blocks_with_no_merged_number() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    device(&store, "dev-desk", "desktop", Some(120));
+
+    // Claude: 5h + week.
+    snapshot(&store, "claude", "5h", 42.5, Some(4440));
+    snapshot(&store, "claude", "week", 12.3, None);
+    event(
+        &store,
+        "c1",
+        "dev-laptop",
+        "claude",
+        "claude-opus-5",
+        12_000,
+    );
+
+    // Codex: 5h + week.
+    snapshot(&store, "codex", "5h", 61.0, Some(2220));
+    snapshot(&store, "codex", "week", 20.0, None);
+    event(&store, "x1", "dev-desk", "codex", "gpt-5-codex", 8_000);
+
+    // Go: 5h + week + month (month only for Go).
+    snapshot(&store, "go", "5h", 30.0, None);
+    snapshot(&store, "go", "week", 15.0, None);
+    snapshot(&store, "go", "month", 5.0, None);
+    event(&store, "g1", "dev-laptop", "go", "opengo-4", 2_000);
+
+    let report = report::build(&store, NOW).unwrap();
+    let out = text::render(&report);
+
+    let claude = block(&out, "claude");
+    assert!(claude.contains("5h") && claude.contains("week"));
+    assert!(!claude.contains("month"), "claude has no month window");
+
+    let codex = block(&out, "codex");
+    assert!(codex.contains("5h") && codex.contains("week"));
+    assert!(!codex.contains("month"), "codex has no month window");
+
+    let go = block(&out, "go");
+    assert!(go.contains("5h") && go.contains("week") && go.contains("month"));
+
+    assert!(
+        !out.contains("total"),
+        "sources never merged into an overall number: {out}"
+    );
+
+    // JSON mirrors the same structure: three sources, each with its own windows.
+    let doc: serde_json::Value = serde_json::from_str(&report::json::render(&report)).unwrap();
+    let sources = doc["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 3);
+    let go_json = sources.iter().find(|s| s["source"] == "go").unwrap();
+    assert_eq!(go_json["windows"].as_array().unwrap().len(), 3);
+    assert_eq!(go_json["top_model"]["name"], "opengo-4");
+}
+
+#[test]
+fn disabled_source_is_excluded_and_enabled_source_with_no_data_shows_a_block() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+
+    // A source with data that the user disabled must not appear.
+    store
+        .set_source_mode("codex", aiu::store::SourceMode::Disabled)
+        .unwrap();
+    snapshot(&store, "codex", "5h", 61.0, None);
+    event(&store, "x1", "dev-laptop", "codex", "gpt-5-codex", 800);
+
+    // A source explicitly enabled but with no data yet still shows a block.
+    store
+        .set_source_mode("go", aiu::store::SourceMode::Enabled)
+        .unwrap();
+
+    let report = report::build(&store, NOW).unwrap();
+    let out = text::render(&report);
+
+    assert!(!out.contains("codex"), "disabled source excluded: {out}");
+    assert!(out.contains("go\n"), "enabled source still appears: {out}");
+    assert!(out.contains("no data yet"), "{out}");
+
+    let doc: serde_json::Value = serde_json::from_str(&report::json::render(&report)).unwrap();
+    let sources = doc["sources"].as_array().unwrap();
+    assert!(!sources.iter().any(|s| s["source"] == "codex"));
+    assert!(sources.iter().any(|s| s["source"] == "go"));
 }
 
 // ---- `aiu claude` detail view (issue 02) ----------------------------------

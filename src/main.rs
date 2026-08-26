@@ -32,8 +32,44 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     Ok(Store::open(&db_path)?)
 }
 
+/// A quick local refresh before rendering: mint the machine identity once,
+/// discover local source files, and stream their deltas into the store. A
+/// broken source is contained — the report still renders from whatever is
+/// already (and newly) persisted.
+fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
+    let identity = aiu::identity::ensure_local_identity(store)?;
+    let Some(home) = paths::home_dir() else {
+        return Ok(());
+    };
+    let now = aiu::utc::now_epoch();
+    let ctx = aiu::adapters::IngestContext {
+        device_id: identity.device_id,
+        workspace_id: identity.workspace_id,
+        now_epoch: now,
+    };
+
+    for discovered in aiu::discover::discover(&home) {
+        let Some(adapter) = aiu::collect::adapter_for(discovered.source) else {
+            continue;
+        };
+        if discovered.files.is_empty() {
+            continue;
+        }
+        // Source-level containment: a failing source never aborts the report.
+        aiu::collect::collect_source(
+            store,
+            adapter,
+            &discovered.files,
+            &ctx,
+            aiu::import::ImportOptions::default(),
+        )?;
+    }
+    Ok(())
+}
+
 fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
+    quick_collect(&store)?;
     let report = report::build(&store, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", report::json::render(&report));

@@ -21,7 +21,8 @@ pub fn data_dir() -> Option<PathBuf> {
     home_dir().map(|home| default_data_dir_for(&home))
 }
 
-fn home_dir() -> Option<PathBuf> {
+/// The user's home directory, used by local source-file discovery.
+pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
