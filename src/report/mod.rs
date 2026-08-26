@@ -5,6 +5,7 @@
 //! feeds normalized events/snapshots into an in-memory store and asserts on
 //! what comes out here.
 
+pub mod breakdown;
 pub mod detail;
 pub mod json;
 pub mod text;

@@ -21,7 +21,7 @@ use crate::utc;
 /// maps the window names vendors report to their rolling duration so
 /// breakdowns can be filtered to exactly the window shown. Windows without
 /// an entry render vendor data but no attribution span.
-fn window_span_secs(window: &str) -> Option<u64> {
+pub(crate) fn window_span_secs(window: &str) -> Option<u64> {
     match window {
         "5h" => Some(5 * 3600),
         "week" => Some(7 * 86_400),
@@ -166,7 +166,7 @@ fn shares(
         .collect())
 }
 
-fn share_percent(tokens: i64, total: i64) -> f64 {
+pub(crate) fn share_percent(tokens: i64, total: i64) -> f64 {
     if total == 0 {
         return 0.0;
     }
