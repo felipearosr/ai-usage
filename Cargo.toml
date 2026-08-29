@@ -25,6 +25,9 @@ sha2 = "0.10"
 hmac = "0.12"
 # Clear workspace key material when its owner is dropped.
 zeroize = "1"
+# Established ECDH + KDF primitives for authenticated ephemeral device pairing.
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+hkdf = "0.12"
 
 [profile.release]
 strip = true

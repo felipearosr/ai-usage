@@ -15,6 +15,7 @@ pub mod import;
 pub mod migrations;
 pub mod paths;
 pub mod report;
+pub mod setup;
 pub mod sources;
 pub mod store;
 pub mod sync;

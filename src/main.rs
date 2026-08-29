@@ -38,6 +38,14 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Init) => die(
+            1,
+            "the hosted pairing relay is not configured in this build; setup is available through the relay client seam",
+        ),
+        Ok(Command::Join { code: _ }) => die(
+            1,
+            "the hosted pairing relay is not configured in this build; setup is available through the relay client seam",
+        ),
         Err(e) => die(2, e),
     }
 }
