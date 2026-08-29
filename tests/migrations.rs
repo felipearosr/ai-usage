@@ -24,6 +24,7 @@ fn migrations_apply_from_empty_and_are_idempotent() {
         "usage_events",
         "quota_snapshots",
         "sync_outbox",
+        "sync_applied_records",
         "sync_cursors",
         "adapter_state",
         "metadata",
@@ -37,6 +38,37 @@ fn migrations_apply_from_empty_and_are_idempotent() {
             .unwrap();
         assert_eq!(count, 1, "table {table} should exist");
     }
+}
+
+#[test]
+fn sync_migration_preserves_an_existing_outbox() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for (index, migration) in MIGRATIONS.iter().take(2).enumerate() {
+        conn.execute_batch(&format!(
+            "BEGIN; {migration} PRAGMA user_version = {}; COMMIT;",
+            index + 1
+        ))
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO sync_outbox (record_kind, payload) VALUES ('usage_event', x'010203')",
+        [],
+    )
+    .unwrap();
+
+    store::apply_migrations(&conn).unwrap();
+
+    let row: (String, String, Vec<u8>, Option<String>) = conn
+        .query_row(
+            "SELECT record_id, record_kind, payload, sent_at_utc FROM sync_outbox",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, "legacy:1");
+    assert_eq!(row.1, "usage_event");
+    assert_eq!(row.2, vec![1, 2, 3]);
+    assert_eq!(row.3, None);
 }
 
 #[test]

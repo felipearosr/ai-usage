@@ -6,6 +6,7 @@ use std::fmt;
 pub enum AiuError {
     Db(rusqlite::Error),
     Io(std::io::Error),
+    Serialization(serde_json::Error),
     NoDataDir,
     /// An adapter received data whose format it does not recognize. This is
     /// loud and source-scoped: that source stops, diagnostics are recorded,
@@ -21,6 +22,7 @@ impl fmt::Display for AiuError {
         match self {
             AiuError::Db(e) => write!(f, "database error: {e}"),
             AiuError::Io(e) => write!(f, "io error: {e}"),
+            AiuError::Serialization(e) => write!(f, "serialization error: {e}"),
             AiuError::NoDataDir => {
                 write!(f, "could not determine data directory (is HOME set?)")
             }
@@ -44,6 +46,12 @@ impl From<rusqlite::Error> for AiuError {
 impl From<std::io::Error> for AiuError {
     fn from(e: std::io::Error) -> Self {
         AiuError::Io(e)
+    }
+}
+
+impl From<serde_json::Error> for AiuError {
+    fn from(e: serde_json::Error) -> Self {
+        AiuError::Serialization(e)
     }
 }
 
