@@ -132,4 +132,31 @@ pub const MIGRATIONS: &[&str] = &[
     CREATE INDEX idx_usage_events_source_ts ON usage_events(source, ts_utc);
     CREATE INDEX idx_usage_events_device_ts ON usage_events(device_id, ts_utc);
     ",
+    // v3 — durable sync record identities and inbox idempotency. The original
+    // outbox rows predate record IDs; preserve them under opaque legacy IDs.
+    "
+    ALTER TABLE sync_outbox RENAME TO sync_outbox_v2;
+
+    CREATE TABLE sync_outbox (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        record_id      TEXT NOT NULL UNIQUE,
+        record_kind    TEXT NOT NULL,
+        payload        BLOB NOT NULL,
+        created_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+        sent_at_utc    TEXT
+    );
+
+    INSERT INTO sync_outbox (id, record_id, record_kind, payload, created_at_utc, sent_at_utc)
+    SELECT id, 'legacy:' || id, record_kind, payload, created_at_utc, sent_at_utc
+    FROM sync_outbox_v2;
+
+    DROP TABLE sync_outbox_v2;
+    CREATE INDEX idx_sync_outbox_unsent ON sync_outbox(sent_at_utc)
+        WHERE sent_at_utc IS NULL;
+
+    CREATE TABLE sync_applied_records (
+        record_id     TEXT PRIMARY KEY,
+        applied_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    );
+    ",
 ];

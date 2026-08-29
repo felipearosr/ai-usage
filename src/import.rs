@@ -76,8 +76,10 @@ impl<'a> StoreSink<'a> {
 
 impl EventSink for StoreSink<'_> {
     fn accept_event(&mut self, event: crate::store::NewEvent) -> Result<bool> {
+        let sync_record = crate::sync::SyncRecord::UsageEvent(Box::new(event.clone()));
         let stored = self.store.record_event(&event)?;
         if stored {
+            crate::sync::enqueue_record(self.store, &sync_record)?;
             self.events_new += 1;
         } else {
             self.duplicates += 1;
@@ -96,8 +98,10 @@ impl EventSink for StoreSink<'_> {
     }
 
     fn accept_snapshot(&mut self, snapshot: crate::store::NewSnapshot) -> Result<bool> {
+        let sync_record = crate::sync::SyncRecord::QuotaSnapshot(Box::new(snapshot.clone()));
         let stored = self.store.record_snapshot_if_changed(&snapshot)?;
         if stored {
+            crate::sync::enqueue_record(self.store, &sync_record)?;
             self.snapshots_new += 1;
         }
         Ok(stored)

@@ -15,6 +15,11 @@ pub struct Store {
     conn: Connection,
 }
 
+pub(crate) struct PendingSyncRecord {
+    pub outbox_id: i64,
+    pub payload: Vec<u8>,
+}
+
 pub struct NewDevice {
     pub device_id: String,
     pub friendly_name: String,
@@ -23,7 +28,7 @@ pub struct NewDevice {
     pub last_sync_at_utc: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NewEvent {
     pub event_id: String,
     pub workspace_id: String,
@@ -45,6 +50,7 @@ pub struct NewEvent {
     pub adapter_version: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NewSnapshot {
     pub source: String,
     pub window: String,
@@ -318,6 +324,96 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         Ok(rows)
+    }
+
+    pub(crate) fn enqueue_sync_record(
+        &self,
+        record_id: &str,
+        record_kind: &str,
+        payload: &[u8],
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO sync_outbox (record_id, record_kind, payload)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![record_id, record_kind, payload],
+        )?;
+        Ok(changed == 1)
+    }
+
+    pub(crate) fn pending_sync_records(&self) -> Result<Vec<PendingSyncRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, payload FROM sync_outbox
+             WHERE sent_at_utc IS NULL ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PendingSyncRecord {
+                    outbox_id: row.get(0)?,
+                    payload: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn pending_sync_count(&self) -> Result<u64> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sync_outbox WHERE sent_at_utc IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub(crate) fn mark_sync_records_sent(&self, outbox_ids: &[i64]) -> Result<()> {
+        let sent_at = crate::utc::now_rfc3339();
+        for id in outbox_ids {
+            self.conn.execute(
+                "UPDATE sync_outbox SET sent_at_utc = ?2 WHERE id = ?1",
+                rusqlite::params![id, sent_at],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn sync_cursor(&self) -> Result<Option<String>> {
+        let value = self.conn.query_row(
+            "SELECT value FROM sync_cursors WHERE name = 'relay'",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match value {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub(crate) fn set_sync_cursor(&self, cursor: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_cursors (name, value) VALUES ('relay', ?1)
+             ON CONFLICT(name) DO UPDATE SET
+                 value = excluded.value,
+                 updated_at_utc = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            rusqlite::params![cursor],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn sync_record_applied(&self, record_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sync_applied_records WHERE record_id = ?1)",
+            rusqlite::params![record_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub(crate) fn mark_sync_record_applied(&self, record_id: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO sync_applied_records (record_id) VALUES (?1)",
+            rusqlite::params![record_id],
+        )?;
+        Ok(())
     }
 }
 

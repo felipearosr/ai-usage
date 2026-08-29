@@ -15,6 +15,16 @@ path = "src/main.rs"
 rusqlite = { version = "0.40", features = ["bundled"] }
 # `--json` output on report commands is mandated by the spec.
 serde_json = "1"
+# Sync records have a stable, typed wire representation before encryption.
+serde = { version = "1", features = ["derive"] }
+# Audited AEAD primitive; XChaCha20's extended nonce is safe for random use.
+chacha20poly1305 = "0.10"
+# Opaque deterministic relay record IDs without exposing provider metadata.
+sha2 = "0.10"
+# Key relay record IDs so low-domain quota values cannot be dictionary-tested.
+hmac = "0.12"
+# Clear workspace key material when its owner is dropped.
+zeroize = "1"
 
 [profile.release]
 strip = true
