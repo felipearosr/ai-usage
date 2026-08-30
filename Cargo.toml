@@ -28,6 +28,9 @@ zeroize = "1"
 # Established ECDH + KDF primitives for authenticated ephemeral device pairing.
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 hkdf = "0.12"
+# Small blocking HTTPS client for the opaque hosted relay protocol. Blocking
+# I/O matches this short-lived CLI and avoids an async runtime.
+ureq = { version = "3", default-features = false, features = ["rustls", "json"] }
 
 [profile.release]
 strip = true

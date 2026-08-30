@@ -29,6 +29,7 @@ struct FakeRelay {
     offers: HashMap<String, OfferState>,
     records: Vec<EncryptedRecord>,
     record_ids: HashSet<(String, String)>,
+    fail_publish: bool,
 }
 
 impl FakeRelay {
@@ -75,6 +76,9 @@ impl PairingRelay for FakeRelay {
         device_credential: &str,
         offer: PairingOffer,
     ) -> Result<(), PairingRelayError> {
+        if self.fail_publish {
+            return Err(PairingRelayError::Unavailable);
+        }
         if !self.authorized(&offer.workspace_id, device_credential) {
             return Err(PairingRelayError::Unauthorized);
         }
@@ -268,7 +272,7 @@ fn init_and_join_import_fixture_history_and_sync_immediately() {
 
     let attempt = start_join(&mut relay, &initialized.pairing_code, "laptop", now + 1).unwrap();
     assert!(complete_host_pairing(&host_store, &mut relay, &initialized.pairing, now + 2).unwrap());
-    let joined = finish_join(&join_store, &mut relay, attempt, &join_home, now + 3).unwrap();
+    let joined = finish_join(&join_store, &mut relay, &attempt, &join_home, now + 3).unwrap();
     assert_eq!(joined.workspace_id, initialized.workspace_id);
     assert_eq!(joined.detected_sources, vec!["codex"]);
     assert_eq!(joined.imports[0].events_imported, 1);
@@ -321,7 +325,7 @@ fn codes_expire_are_single_use_and_do_not_contain_the_workspace_key() {
         Err(SetupError::Relay(PairingRelayError::Used))
     ));
     complete_host_pairing(&host_store, &mut relay, &initialized.pairing, 103).unwrap();
-    finish_join(&join_store, &mut relay, attempt, &home, 104).unwrap();
+    finish_join(&join_store, &mut relay, &attempt, &home, 104).unwrap();
     assert!(matches!(
         start_join(&mut relay, &initialized.pairing_code, "stolen", 105),
         Err(SetupError::Relay(PairingRelayError::Used))
@@ -376,5 +380,28 @@ fn setup_requires_a_machine_name_and_adopts_preexisting_local_ids() {
     let initialized = init_workspace(&store, &mut relay, "desktop", &home, 10).unwrap();
     assert_eq!(initialized.workspace_id, existing.workspace_id);
     assert_eq!(initialized.device_id, existing.device_id);
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn failed_offer_publication_does_not_poison_local_setup() {
+    let home = temp_home("retry");
+    let store = Store::open_in_memory().unwrap();
+    let mut relay = FakeRelay {
+        fail_publish: true,
+        ..FakeRelay::default()
+    };
+
+    assert!(matches!(
+        init_workspace(&store, &mut relay, "desktop", &home, 10),
+        Err(SetupError::Relay(PairingRelayError::Unavailable))
+    ));
+    relay.fail_publish = false;
+    let initialized = init_workspace(&store, &mut relay, "desktop", &home, 11).unwrap();
+    assert_eq!(
+        relay.workspace_credentials[&initialized.workspace_id].len(),
+        1,
+        "a retry must reuse the pending device credential"
+    );
     std::fs::remove_dir_all(home).ok();
 }

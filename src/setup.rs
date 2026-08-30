@@ -105,7 +105,7 @@ impl From<serde_json::Error> for SetupError {
 
 pub type Result<T> = std::result::Result<T, SetupError>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PairingOffer {
     pub locator: String,
     pub workspace_id: String,
@@ -113,14 +113,14 @@ pub struct PairingOffer {
     pub expires_at_epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JoinRequest {
     pub request_id: String,
     pub joiner_public_key: [u8; 32],
     pub device_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedGrant {
     pub nonce: [u8; 24],
     pub ciphertext: Vec<u8>,
@@ -288,10 +288,28 @@ pub fn init_workspace(
     let existing = crate::identity::ensure_local_identity(store)?;
     let workspace_id = existing.workspace_id;
     let device_id = existing.device_id;
-    let device_credential = random_hex(32);
-    let workspace_key = random_array::<32>();
+    let device_credential = match store.get_metadata(DEVICE_CREDENTIAL)? {
+        Some(value) => value,
+        None => {
+            let value = random_hex(32);
+            store.set_metadata(DEVICE_CREDENTIAL, &value)?;
+            value
+        }
+    };
+    let workspace_key = match store
+        .get_metadata(WORKSPACE_KEY)?
+        .and_then(|value| decode_array::<32>(&value))
+    {
+        Some(value) => value,
+        None => {
+            let value = random_array::<32>();
+            store.set_metadata(WORKSPACE_KEY, &hex(&value))?;
+            value
+        }
+    };
 
     relay.register_workspace(&workspace_id, &device_credential)?;
+    let pairing = publish_pairing(relay, &workspace_id, &device_credential, now_epoch)?;
     persist_identity(
         store,
         &workspace_id,
@@ -302,7 +320,6 @@ pub fn init_workspace(
     )?;
     let (detected_sources, imports) =
         import_history(store, home, &workspace_id, &device_id, now_epoch)?;
-    let pairing = begin_pairing(store, relay, now_epoch)?;
     let pairing_code = pairing.code().to_string();
 
     Ok(InitOutcome {
@@ -321,6 +338,20 @@ pub fn begin_pairing(
     now_epoch: u64,
 ) -> Result<HostPairing> {
     let secrets = load_local_secrets(store)?;
+    publish_pairing(
+        relay,
+        &secrets.workspace_id,
+        &secrets.device_credential,
+        now_epoch,
+    )
+}
+
+fn publish_pairing(
+    relay: &mut dyn PairingRelay,
+    workspace_id: &str,
+    device_credential: &str,
+    now_epoch: u64,
+) -> Result<HostPairing> {
     let secret = StaticSecret::random_from_rng(OsRng);
     let public_key = PublicKey::from(&secret).to_bytes();
     let locator = random_array::<8>();
@@ -331,10 +362,10 @@ pub fn begin_pairing(
     };
     let expires_at_epoch = now_epoch.saturating_add(PAIRING_LIFETIME_SECS);
     relay.publish_offer(
-        &secrets.device_credential,
+        device_credential,
         PairingOffer {
             locator: code.locator(),
-            workspace_id: secrets.workspace_id,
+            workspace_id: workspace_id.to_string(),
             host_public_key: public_key,
             expires_at_epoch,
         },
@@ -426,7 +457,7 @@ pub fn complete_host_pairing(
 pub fn finish_join(
     store: &Store,
     relay: &mut dyn PairingRelay,
-    attempt: JoinAttempt,
+    attempt: &JoinAttempt,
     home: &Path,
     now_epoch: u64,
 ) -> Result<JoinOutcome> {
@@ -435,7 +466,7 @@ pub fn finish_join(
         return Err(SetupError::Expired);
     }
     let grant = relay.take_grant(&attempt.code.locator(), &attempt.request_id, now_epoch)?;
-    let mut payload = decrypt_grant(&attempt, &grant)?;
+    let mut payload = decrypt_grant(attempt, &grant)?;
     persist_identity(
         store,
         &payload.workspace_id,
@@ -450,7 +481,7 @@ pub fn finish_join(
         import_history(store, home, &workspace_id, &attempt.device_id, now_epoch)?;
     Ok(JoinOutcome {
         workspace_id,
-        device_id: attempt.device_id,
+        device_id: attempt.device_id.clone(),
         detected_sources,
         imports,
     })
