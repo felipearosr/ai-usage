@@ -30,6 +30,14 @@ pub struct SourceCollect {
     pub snapshots_stored: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollectProgress {
+    pub source: &'static str,
+    pub file_index: usize,
+    pub file_count: usize,
+    pub records_seen: u64,
+}
+
 impl SourceCollect {
     fn accumulate(&mut self, summary: ImportSummary) {
         self.events_imported += summary.events_imported;
@@ -52,7 +60,18 @@ pub fn collect_reader(
     ctx: &IngestContext,
     opts: ImportOptions,
 ) -> Result<Option<ImportSummary>> {
-    match import_usage(store, adapter, reader, ctx, opts, &mut |_| {}) {
+    collect_reader_with_progress(store, adapter, reader, ctx, opts, &mut |_| {})
+}
+
+fn collect_reader_with_progress(
+    store: &Store,
+    adapter: &dyn SourceAdapter,
+    reader: &mut dyn BufRead,
+    ctx: &IngestContext,
+    opts: ImportOptions,
+    progress: &mut dyn FnMut(u64),
+) -> Result<Option<ImportSummary>> {
+    match import_usage(store, adapter, reader, ctx, opts, progress) {
         Ok(summary) => Ok(Some(summary)),
         Err(AiuError::UnrecognizedFormat { .. }) | Err(AiuError::Io(_)) => Ok(None),
         Err(e) => Err(e),
@@ -69,11 +88,22 @@ pub fn collect_source(
     ctx: &IngestContext,
     opts: ImportOptions,
 ) -> Result<SourceCollect> {
+    collect_source_with_progress(store, adapter, files, ctx, opts, &mut |_| {})
+}
+
+fn collect_source_with_progress(
+    store: &Store,
+    adapter: &dyn SourceAdapter,
+    files: &[PathBuf],
+    ctx: &IngestContext,
+    opts: ImportOptions,
+    progress: &mut dyn FnMut(CollectProgress),
+) -> Result<SourceCollect> {
     let mut result = SourceCollect {
         source: adapter.source(),
         ..SourceCollect::default()
     };
-    for path in files {
+    for (index, path) in files.iter().enumerate() {
         result.files_attempted += 1;
         let file = match std::fs::File::open(path) {
             Ok(f) => f,
@@ -83,7 +113,15 @@ pub fn collect_source(
             }
         };
         let mut reader = std::io::BufReader::new(file);
-        match collect_reader(store, adapter, &mut reader, ctx, opts)? {
+        let mut report = |records_seen| {
+            progress(CollectProgress {
+                source: adapter.source(),
+                file_index: index + 1,
+                file_count: files.len(),
+                records_seen,
+            });
+        };
+        match collect_reader_with_progress(store, adapter, &mut reader, ctx, opts, &mut report)? {
             Some(summary) => result.accumulate(summary),
             None => result.files_failed += 1,
         }
@@ -115,6 +153,15 @@ pub fn collect_detected(
     home: &Path,
     ctx: &IngestContext,
 ) -> Result<Vec<SourceCollect>> {
+    collect_detected_with_progress(store, home, ctx, &mut |_| {})
+}
+
+pub fn collect_detected_with_progress(
+    store: &Store,
+    home: &Path,
+    ctx: &IngestContext,
+    progress: &mut dyn FnMut(CollectProgress),
+) -> Result<Vec<SourceCollect>> {
     let mut results = Vec::new();
     for detection in crate::sources::detect(home) {
         let mode = store.source_mode(detection.source)?;
@@ -128,13 +175,15 @@ pub fn collect_detected(
         if files.is_empty() {
             continue;
         }
-        results.push(collect_source(
+        let result = collect_source_with_progress(
             store,
             adapter,
             &files,
             ctx,
             ImportOptions::default(),
-        )?);
+            progress,
+        )?;
+        results.push(result);
     }
     Ok(results)
 }

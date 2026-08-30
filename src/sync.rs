@@ -64,6 +64,10 @@ impl WorkspaceKey {
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub(crate) fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
 impl Drop for WorkspaceKey {
@@ -104,7 +108,7 @@ impl SyncRecord {
 
 /// The relay-visible form. The workspace and record IDs are opaque routing
 /// values. All usage metadata remains inside authenticated ciphertext.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedRecord {
     pub workspace_id: String,
     pub record_id: String,
@@ -129,7 +133,7 @@ impl fmt::Display for RelayError {
 
 impl std::error::Error for RelayError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DownloadBatch {
     pub records: Vec<EncryptedRecord>,
     pub cursor: String,

@@ -2,6 +2,8 @@ use aiu::cli::{self, BreakdownKind, Command};
 use aiu::paths;
 use aiu::report::{self, breakdown, detail};
 use aiu::store::{SourceMode, Store};
+use std::io::Write;
+use std::time::Duration;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -38,6 +40,16 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Init) => {
+            if let Err(e) = run_init() {
+                die(1, e);
+            }
+        }
+        Ok(Command::Join { code }) => {
+            if let Err(e) = run_join(&code) {
+                die(1, e);
+            }
+        }
         Err(e) => die(2, e),
     }
 }
@@ -50,6 +62,115 @@ fn die(code: i32, err: impl std::fmt::Display) -> ! {
 fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     let db_path = paths::db_path().ok_or(aiu::error::AiuError::NoDataDir)?;
     Ok(Store::open(&db_path)?)
+}
+
+fn prompt_machine_name() -> Result<String, Box<dyn std::error::Error>> {
+    print!("Machine name: ");
+    std::io::stdout().flush()?;
+    let mut name = String::new();
+    std::io::stdin().read_line(&mut name)?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("machine name cannot be empty".into());
+    }
+    Ok(name)
+}
+
+fn setup_home() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
+    paths::home_dir().ok_or_else(|| aiu::error::AiuError::NoDataDir.into())
+}
+
+fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    if aiu::setup::is_initialized(&store)? {
+        let pairing = aiu::setup::begin_pairing(&store, &mut relay, aiu::utc::now_epoch())?;
+        println!("Workspace already initialized.");
+        println!("Pair another machine within 10 minutes:");
+        println!("  aiu join {}", pairing.code());
+        return wait_for_join(&store, &mut relay, &pairing);
+    }
+
+    let name = prompt_machine_name()?;
+    let home = setup_home()?;
+    println!("Detecting sources and importing local history...");
+    let outcome = aiu::setup::init_workspace_with_progress(
+        &store,
+        &mut relay,
+        &name,
+        &home,
+        aiu::utc::now_epoch(),
+        &mut print_import_progress,
+    )?;
+    print!("{}", aiu::setup::render_init(&outcome));
+    println!("Workspace setup is complete. Waiting for the joining machine...");
+    println!("Press Ctrl-C if you are not pairing now; run `aiu init` later for a fresh code.");
+    wait_for_join(&store, &mut relay, &outcome.pairing)
+}
+
+fn wait_for_join(
+    store: &Store,
+    relay: &mut aiu::relay::HttpRelayClient,
+    pairing: &aiu::setup::HostPairing,
+) -> Result<(), Box<dyn std::error::Error>> {
+    loop {
+        match aiu::setup::complete_host_pairing(store, relay, pairing, aiu::utc::now_epoch()) {
+            Ok(true) => break,
+            Ok(false) => std::thread::sleep(Duration::from_millis(500)),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    println!("Machine paired.");
+    sync_after_setup(store, relay);
+    Ok(())
+}
+
+fn run_join(code: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let name = prompt_machine_name()?;
+    let home = setup_home()?;
+    let store = open_store()?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    let attempt = aiu::setup::start_join(&mut relay, code, &name, aiu::utc::now_epoch())?;
+    println!("Pairing accepted. Waiting for the first machine...");
+    let outcome = loop {
+        match aiu::setup::finish_join_with_progress(
+            &store,
+            &mut relay,
+            &attempt,
+            &home,
+            aiu::utc::now_epoch(),
+            &mut print_import_progress,
+        ) {
+            Ok(outcome) => break outcome,
+            Err(aiu::setup::SetupError::Relay(aiu::setup::PairingRelayError::NotFound)) => {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    print!("{}", aiu::setup::render_join(&outcome));
+    sync_after_setup(&store, &mut relay);
+    Ok(())
+}
+
+fn print_import_progress(progress: aiu::collect::CollectProgress) {
+    println!(
+        "Importing {}: file {}/{}, {} records read",
+        progress.source, progress.file_index, progress.file_count, progress.records_seen
+    );
+}
+
+fn sync_after_setup(store: &Store, relay: &mut aiu::relay::HttpRelayClient) {
+    match aiu::setup::load_sync_config(store, 500) {
+        Ok(config) => {
+            if let Err(error) = aiu::sync::sync_once(store, relay, &config) {
+                eprintln!("aiu: setup completed; initial sync will retry later: {error}");
+            }
+        }
+        Err(error) => {
+            eprintln!("aiu: setup completed; initial sync will retry later: {error}");
+        }
+    }
 }
 
 /// A quick local refresh before rendering: mint the machine identity once,

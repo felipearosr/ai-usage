@@ -36,6 +36,10 @@ pub enum Command {
         source: String,
         json: bool,
     },
+    Init,
+    Join {
+        code: String,
+    },
     Help,
     Version,
 }
@@ -68,6 +72,8 @@ USAGE:
     aiu sources [--json]            list detection + per-source overrides
     aiu sources detect [--json]     re-run source detection
     aiu sources <mode> <source>     enable | disable | auto a source
+    aiu init                        create a workspace and pairing code
+    aiu join <code>                 join an existing workspace
 
 SOURCES:
     claude    Claude Code
@@ -116,6 +122,11 @@ where
 
     match positionals.as_slice() {
         [] => Ok(Command::Report { json }),
+        [command] if command == "init" && !json => Ok(Command::Init),
+        [command, code] if command == "join" && !json => Ok(Command::Join { code: code.clone() }),
+        [command, ..] if command == "init" || command == "join" => Err(ArgsError(format!(
+            "invalid setup command\nusage: aiu init | aiu join <code>\n\n{USAGE}"
+        ))),
         [s] if s == "sources" => Ok(Command::Sources { json }),
         [s, sub] if s == "sources" && sub == "detect" => Ok(Command::SourcesDetect { json }),
         [s, mode, source] if s == "sources" && is_source(source) => {
@@ -313,6 +324,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn init_and_join_commands_parse() {
+        assert_eq!(parse(args(&["init"])).unwrap(), Command::Init);
+        assert_eq!(
+            parse(args(&["join", "abc-def"])).unwrap(),
+            Command::Join {
+                code: "abc-def".to_string()
+            }
+        );
+        assert!(parse(args(&["join"])).is_err());
+        assert!(parse(args(&["init", "extra"])).is_err());
+        assert!(parse(args(&["init", "--json"])).is_err());
     }
 
     #[test]

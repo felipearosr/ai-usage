@@ -134,6 +134,28 @@ impl Store {
         Ok(changed == 1)
     }
 
+    /// Creates the local device row or refreshes its user-selected identity.
+    /// Synced placeholder rows still use `ensure_device`, which never
+    /// overwrites names learned through the encrypted record stream.
+    pub fn upsert_local_device(&self, device: &NewDevice) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO devices (device_id, friendly_name, os, arch, last_sync_at_utc)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(device_id) DO UPDATE SET
+                 friendly_name = excluded.friendly_name,
+                 os = excluded.os,
+                 arch = excluded.arch",
+            rusqlite::params![
+                device.device_id,
+                device.friendly_name,
+                device.os,
+                device.arch,
+                device.last_sync_at_utc
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn touch_device_sync(&self, device_id: &str, ts_utc: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE devices SET last_sync_at_utc = ?2 WHERE device_id = ?1",
