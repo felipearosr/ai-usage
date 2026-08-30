@@ -176,18 +176,22 @@ fn run_import(
 ) -> Result<ImportSummary> {
     let mut sink = StoreSink::new(store, opts.commit_every)?;
     let mut last_reported = 0u64;
-    let mut reporter = |seen: u64| {
-        if seen.saturating_sub(last_reported) >= opts.progress_every.max(1) {
-            last_reported = seen;
-            progress(seen);
-        }
+    let result = {
+        let mut reporter = |seen: u64| {
+            if seen.saturating_sub(last_reported) >= opts.progress_every.max(1) {
+                last_reported = seen;
+                progress(seen);
+            }
+        };
+        ingest(adapter, ctx, &mut sink, &mut reporter)
     };
-
-    let result = ingest(adapter, ctx, &mut sink, &mut reporter);
 
     match result {
         Ok(summary) => {
             sink.finish()?;
+            if summary.records_seen > last_reported {
+                progress(summary.records_seen);
+            }
             // The adapter reports in-stream duplicates; the sink reports
             // storage-level repeats (already-known deterministic ids).
             Ok(ImportSummary {

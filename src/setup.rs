@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
-use crate::collect::SourceCollect;
+use crate::collect::{CollectProgress, SourceCollect};
 use crate::store::{NewDevice, Store};
 use crate::sync::{SyncConfig, WorkspaceKey};
 
@@ -289,7 +289,7 @@ pub fn init_workspace_with_progress(
     friendly_name: &str,
     home: &Path,
     now_epoch: u64,
-    progress: &mut dyn FnMut(&SourceCollect),
+    progress: &mut dyn FnMut(CollectProgress),
 ) -> Result<InitOutcome> {
     validate_fresh(store)?;
     validate_friendly_name(friendly_name)?;
@@ -481,7 +481,7 @@ pub fn finish_join_with_progress(
     attempt: &JoinAttempt,
     home: &Path,
     now_epoch: u64,
-    progress: &mut dyn FnMut(&SourceCollect),
+    progress: &mut dyn FnMut(CollectProgress),
 ) -> Result<JoinOutcome> {
     validate_fresh(store)?;
     if attempt.expires_at_epoch < now_epoch {
@@ -523,6 +523,10 @@ pub fn load_sync_config(store: &Store, download_limit: usize) -> Result<SyncConf
         key: secrets.workspace_key,
         download_limit,
     })
+}
+
+pub fn is_initialized(store: &Store) -> Result<bool> {
+    Ok(store.get_metadata(SETUP_COMPLETE)?.as_deref() == Some("1"))
 }
 
 pub fn render_init(outcome: &InitOutcome) -> String {
@@ -631,7 +635,7 @@ fn import_history(
     workspace_id: &str,
     device_id: &str,
     now_epoch: u64,
-    progress: &mut dyn FnMut(&SourceCollect),
+    progress: &mut dyn FnMut(CollectProgress),
 ) -> Result<(Vec<&'static str>, Vec<SourceCollect>)> {
     let detections = crate::sources::detect(home);
     let detected_sources = detections

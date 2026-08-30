@@ -83,7 +83,7 @@ fn setup_home() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
 fn run_init() -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
     let mut relay = aiu::relay::HttpRelayClient::from_env()?;
-    if store.get_metadata("setup_complete")?.as_deref() == Some("1") {
+    if aiu::setup::is_initialized(&store)? {
         let pairing = aiu::setup::begin_pairing(&store, &mut relay, aiu::utc::now_epoch())?;
         println!("Workspace already initialized.");
         println!("Pair another machine within 10 minutes:");
@@ -153,13 +153,10 @@ fn run_join(code: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn print_import_progress(progress: &aiu::collect::SourceCollect) {
+fn print_import_progress(progress: aiu::collect::CollectProgress) {
     println!(
-        "Imported {}: {} records from {} files ({} malformed skipped)",
-        progress.source,
-        progress.events_imported,
-        progress.files_attempted,
-        progress.malformed_skipped
+        "Importing {}: file {}/{}, {} records read",
+        progress.source, progress.file_index, progress.file_count, progress.records_seen
     );
 }
 

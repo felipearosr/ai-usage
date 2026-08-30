@@ -416,10 +416,10 @@ fn setup_reports_import_progress_per_detected_source() {
     let mut updates = Vec::new();
 
     init_workspace_with_progress(&store, &mut relay, "desktop", &home, 10, &mut |item| {
-        updates.push((item.source, item.events_imported))
+        updates.push((item.source, item.records_seen))
     })
     .unwrap();
 
-    assert_eq!(updates, vec![("claude", 1), ("codex", 1)]);
+    assert_eq!(updates, vec![("claude", 1), ("codex", 3)]);
     std::fs::remove_dir_all(home).ok();
 }
