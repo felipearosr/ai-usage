@@ -75,6 +75,7 @@ pub struct Share {
     pub name: String,
     pub output_tokens: i64,
     pub share_percent: f64,
+    pub stale: bool,
 }
 
 /// Builds the detail view through the same queries the CLI renders.
@@ -89,17 +90,18 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         // otherwise breakdown rows would not match the window shown.
         let cutoff = span.map(|s| utc::format_epoch(now_epoch.saturating_sub(s)));
         let machines = match &cutoff {
-            Some(cutoff) => shares(
+            Some(cutoff) => machine_shares(
                 conn,
-                "SELECT d.friendly_name, SUM(e.output_tokens)
+                "SELECT d.friendly_name, SUM(e.output_tokens), d.last_sync_at_utc
                  FROM usage_events e
                  JOIN devices d ON d.device_id = e.device_id
                  WHERE e.source = ?1 AND e.ts_utc >= ?2
-                 GROUP BY e.device_id, d.friendly_name
+                 GROUP BY e.device_id, d.friendly_name, d.last_sync_at_utc
                  HAVING SUM(e.output_tokens) > 0
                  ORDER BY SUM(e.output_tokens) DESC, d.friendly_name ASC",
                 source,
                 cutoff,
+                now_epoch,
             )?,
             None => Vec::new(),
         };
@@ -154,6 +156,41 @@ fn shares(
     Ok(rows
         .into_iter()
         .map(|(name, tokens)| Share {
+            share_percent: share_percent(tokens, total),
+            name,
+            output_tokens: tokens,
+            stale: false,
+        })
+        .collect())
+}
+
+fn machine_shares(
+    conn: &rusqlite::Connection,
+    query: &str,
+    source: &str,
+    cutoff_utc: &str,
+    now_epoch: u64,
+) -> crate::error::Result<Vec<Share>> {
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt
+        .query_map(params![source, cutoff_utc], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total: i64 = rows.iter().map(|(_, tokens, _)| *tokens).sum();
+    Ok(rows
+        .into_iter()
+        .map(|(name, tokens, last_sync)| Share {
+            stale: last_sync
+                .as_deref()
+                .and_then(utc::parse_rfc3339_utc)
+                .is_some_and(|synced| {
+                    now_epoch.saturating_sub(synced) > crate::report::STALE_AFTER_SECS
+                }),
             share_percent: share_percent(tokens, total),
             name,
             output_tokens: tokens,

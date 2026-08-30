@@ -245,6 +245,41 @@ fn latest_snapshot_per_window_wins() {
     assert!(!out.contains("10.0% used"));
 }
 
+#[test]
+fn account_quota_observations_from_multiple_devices_are_not_summed() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    device(&store, "dev-desk", "desktop", Some(120));
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "codex".into(),
+            window: "5h".into(),
+            used_percent: 41.0,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 120),
+            observing_device_id: "dev-laptop".into(),
+        })
+        .unwrap();
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "codex".into(),
+            window: "5h".into(),
+            used_percent: 43.0,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 60),
+            observing_device_id: "dev-desk".into(),
+        })
+        .unwrap();
+
+    let report = report::build(&store, NOW).unwrap();
+    let text = text::render(&report);
+    assert!(text.contains("43.0% used"), "{text}");
+    assert!(
+        !text.contains("84.0%"),
+        "quota snapshots are state, not usage: {text}"
+    );
+}
+
 // ---- Compact default command (issue 05) -----------------------------------
 
 /// Extracts the text block belonging to one source, from its header line to
@@ -516,6 +551,51 @@ fn claude_detail_json_shape_matches_text_semantics() {
     let models = five_h["attribution"]["models"].as_array().unwrap();
     assert_eq!(models[0]["name"], "claude-opus-5");
     assert_eq!(models[0]["share_percent"], 97.6);
+}
+
+#[test]
+fn stale_participating_machine_is_marked_in_every_detailed_view() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(120));
+    device(&store, "dev-desk", "desktop", Some(31 * 60));
+    snapshot(&store, "claude", "5h", 42.5, None);
+    event(
+        &store,
+        "fresh",
+        "dev-laptop",
+        "claude",
+        "claude-opus-5",
+        800,
+    );
+    event(&store, "stale", "dev-desk", "claude", "claude-opus-5", 200);
+
+    let detail = detail::build(&store, "claude", NOW).unwrap();
+    let detail_text = detail::text::render(&detail);
+    assert!(detail_text.contains("desktop STALE"), "{detail_text}");
+    let detail_json: serde_json::Value =
+        serde_json::from_str(&detail::json::render(&detail)).unwrap();
+    let desktop = detail_json["windows"][0]["attribution"]["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|machine| machine["name"] == "desktop")
+        .unwrap();
+    assert_eq!(desktop["stale"], true);
+
+    let breakdown = breakdown::build(&store, "claude", NOW).unwrap();
+    let matrix_text = breakdown::text::render_models(&breakdown);
+    let machines_text = breakdown::text::render_machines(&breakdown);
+    assert!(matrix_text.contains("desktop STALE"), "{matrix_text}");
+    assert!(machines_text.contains("desktop STALE"), "{machines_text}");
+    let machines_json: serde_json::Value =
+        serde_json::from_str(&breakdown::json::render_machines(&breakdown)).unwrap();
+    let desktop = machines_json["windows"][0]["machines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|machine| machine["name"] == "desktop")
+        .unwrap();
+    assert_eq!(desktop["stale"], true);
 }
 
 #[test]

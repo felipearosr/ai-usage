@@ -82,6 +82,22 @@ fn pairing_client_sends_the_minimal_join_request() {
 }
 
 #[test]
+fn workspace_registration_associates_the_first_device_with_its_credential() {
+    let (base_url, server) = serve_once("{}");
+    let mut relay = HttpRelayClient::new(&base_url).unwrap();
+    relay
+        .register_workspace("opaque-workspace", "opaque-device", "device-secret")
+        .unwrap();
+
+    let request = server.join().unwrap();
+    let body = request.split_once("\r\n\r\n").unwrap().1;
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["workspace_id"], "opaque-workspace");
+    assert_eq!(json["device_id"], "opaque-device");
+    assert_eq!(json["device_credential"], "device-secret");
+}
+
+#[test]
 fn plaintext_transport_is_limited_to_loopback_testing() {
     assert!(HttpRelayClient::new("http://relay.example.com").is_err());
     assert!(HttpRelayClient::new("http://localhost.attacker.example").is_err());
@@ -135,4 +151,22 @@ fn offer_expiry_is_assigned_by_the_relay_not_the_client() {
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert!(json.get("expires_at_epoch").is_none());
     assert!(json.get("now_epoch").is_none());
+}
+
+#[test]
+fn revocation_uses_device_auth_and_opaque_ids() {
+    let (base_url, server) = serve_once("{}");
+    let mut relay = HttpRelayClient::new(&base_url).unwrap();
+    relay
+        .revoke_device("owner-secret", "opaque-workspace", "opaque-device")
+        .unwrap();
+
+    let request = server.join().unwrap();
+    assert!(request.starts_with("POST /v1/devices/revoke HTTP/1.1"));
+    assert!(request.contains("authorization: Bearer owner-secret"));
+    let body = request.split_once("\r\n\r\n").unwrap().1;
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["workspace_id"], "opaque-workspace");
+    assert_eq!(json["device_id"], "opaque-device");
+    assert_eq!(json.as_object().unwrap().len(), 2);
 }

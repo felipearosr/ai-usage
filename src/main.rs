@@ -40,6 +40,21 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Machines { json }) => {
+            if let Err(e) = run_machines(json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::MachineRename { device, name }) => {
+            if let Err(e) = run_machine_rename(&device, &name) {
+                die(1, e);
+            }
+        }
+        Ok(Command::MachineRemove { device }) => {
+            if let Err(e) = run_machine_remove(&device) {
+                die(1, e);
+            }
+        }
         Ok(Command::Init) => {
             if let Err(e) = run_init() {
                 die(1, e);
@@ -62,6 +77,37 @@ fn die(code: i32, err: impl std::fmt::Display) -> ! {
 fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     let db_path = paths::db_path().ok_or(aiu::error::AiuError::NoDataDir)?;
     Ok(Store::open(&db_path)?)
+}
+
+fn run_machines(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let report = report::fleet::build(&store, aiu::utc::now_epoch())?;
+    if json {
+        println!("{}", report::fleet::render_json(&report));
+    } else {
+        print!("{}", report::fleet::render_text(&report));
+    }
+    Ok(())
+}
+
+fn run_machine_rename(device: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let device_id = aiu::fleet::rename_machine(&store, &config.workspace_id, device, name)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!("Renamed {device_id} to {}.", name.trim());
+    Ok(())
+}
+
+fn run_machine_remove(device: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    let device_id = aiu::fleet::remove_machine(&store, &mut relay, &config, device)?;
+    aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!("Removed {device_id}. Historical usage was kept.");
+    Ok(())
 }
 
 fn prompt_machine_name() -> Result<String, Box<dyn std::error::Error>> {

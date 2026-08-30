@@ -132,6 +132,7 @@ pub trait PairingRelay {
     fn register_workspace(
         &mut self,
         workspace_id: &str,
+        device_id: &str,
         device_credential: &str,
     ) -> std::result::Result<(), PairingRelayError>;
 
@@ -319,7 +320,7 @@ pub fn init_workspace_with_progress(
         }
     };
 
-    relay.register_workspace(&workspace_id, &device_credential)?;
+    relay.register_workspace(&workspace_id, &device_id, &device_credential)?;
     let pairing = publish_pairing(relay, &workspace_id, &device_credential, now_epoch)?;
     persist_identity(
         store,
@@ -517,8 +518,12 @@ pub fn finish_join_with_progress(
 
 pub fn load_sync_config(store: &Store, download_limit: usize) -> Result<SyncConfig> {
     let secrets = load_local_secrets(store)?;
+    let device_id = store
+        .get_metadata(DEVICE_ID)?
+        .ok_or(SetupError::NotInitialized)?;
     Ok(SyncConfig {
         workspace_id: secrets.workspace_id,
+        device_id,
         device_credential: secrets.device_credential,
         key: secrets.workspace_key,
         download_limit,

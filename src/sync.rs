@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::store::{NewEvent, NewSnapshot};
+use crate::store::{DeviceSyncState, NewEvent, NewSnapshot};
 
 #[derive(Debug)]
 pub enum SyncError {
@@ -78,6 +78,7 @@ impl Drop for WorkspaceKey {
 
 pub struct SyncConfig {
     pub workspace_id: String,
+    pub device_id: String,
     pub device_credential: String,
     pub key: WorkspaceKey,
     pub download_limit: usize,
@@ -90,11 +91,20 @@ pub struct SyncSummary {
     pub duplicates_ignored: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceRevocation {
+    pub workspace_id: String,
+    pub device_id: String,
+    pub revoked_at_utc: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "record")]
 pub enum SyncRecord {
     UsageEvent(Box<NewEvent>),
     QuotaSnapshot(Box<NewSnapshot>),
+    DeviceState(Box<DeviceSyncState>),
+    DeviceRevocation(Box<DeviceRevocation>),
 }
 
 impl SyncRecord {
@@ -102,6 +112,8 @@ impl SyncRecord {
         match self {
             SyncRecord::UsageEvent(event) => event.workspace_id == workspace_id,
             SyncRecord::QuotaSnapshot(_) => true,
+            SyncRecord::DeviceState(device) => device.workspace_id == workspace_id,
+            SyncRecord::DeviceRevocation(device) => device.workspace_id == workspace_id,
         }
     }
 }
@@ -156,6 +168,13 @@ pub trait RelayClient {
         after_cursor: Option<&str>,
         limit: usize,
     ) -> std::result::Result<DownloadBatch, RelayError>;
+
+    fn revoke_device(
+        &mut self,
+        device_credential: &str,
+        workspace_id: &str,
+        device_id: &str,
+    ) -> std::result::Result<(), RelayError>;
 }
 
 pub fn encrypt_record(
@@ -239,6 +258,8 @@ pub fn enqueue_record(
     let kind = match record {
         SyncRecord::UsageEvent(_) => "usage_event",
         SyncRecord::QuotaSnapshot(_) => "quota_snapshot",
+        SyncRecord::DeviceState(_) => "device_state",
+        SyncRecord::DeviceRevocation(_) => "device_revocation",
     };
     let payload = serde_json::to_vec(record)?;
     store.enqueue_sync_record(&local_record_id(&payload), kind, &payload)
@@ -251,6 +272,10 @@ pub fn sync_once(
     relay: &mut dyn RelayClient,
     config: &SyncConfig,
 ) -> Result<SyncSummary> {
+    let sync_at = crate::utc::now_rfc3339();
+    let device =
+        store.device_sync_state(&config.workspace_id, &config.device_id, Some(&sync_at))?;
+    enqueue_record(store, &SyncRecord::DeviceState(Box::new(device)))?;
     let pending = store.pending_sync_records()?;
     let encrypted = pending
         .iter()
@@ -270,6 +295,7 @@ pub fn sync_once(
             .map(|item| item.outbox_id)
             .collect::<Vec<_>>();
         store.mark_sync_records_sent(&ids)?;
+        store.touch_device_sync(&config.device_id, &sync_at)?;
     }
 
     let cursor = store.sync_cursor()?;
@@ -312,6 +338,10 @@ fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> 
         SyncRecord::QuotaSnapshot(snapshot) => {
             ensure_device(store, &snapshot.observing_device_id)?;
             store.record_snapshot_if_changed(snapshot)?;
+        }
+        SyncRecord::DeviceState(device) => store.apply_device_sync_state(device)?,
+        SyncRecord::DeviceRevocation(device) => {
+            store.mark_device_revoked(&device.device_id, &device.revoked_at_utc)?
         }
     }
     Ok(())

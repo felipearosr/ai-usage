@@ -73,9 +73,14 @@ fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) 
         window.window
     ));
     for (j, share) in window.matrix.machine_shares().iter().enumerate() {
+        let name = if share.stale {
+            format!("{} STALE", share.name)
+        } else {
+            share.name.clone()
+        };
         out.push_str(&format!(
             "  {:<18} {:>8}  {:>5.1}%\n",
-            share.name,
+            name,
             humanize_tokens(share.output_tokens),
             share.share_percent
         ));
@@ -99,8 +104,19 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
         .max()
         .unwrap_or(0)
         .max(2);
-    let col_widths: Vec<usize> = matrix
+    let machine_labels = matrix
         .machines
+        .iter()
+        .zip(&matrix.machine_stale)
+        .map(|(name, stale)| {
+            if *stale {
+                format!("{name} STALE")
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    let col_widths: Vec<usize> = machine_labels
         .iter()
         .map(|m| m.len().max(PCT_WIDTH))
         .collect();
@@ -108,7 +124,7 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
 
     // Header: machine names across the top, "total" column on the right.
     out.push_str(&format!("  {:<label_width$}  ", ""));
-    for (j, machine) in matrix.machines.iter().enumerate() {
+    for (j, machine) in machine_labels.iter().enumerate() {
         out.push_str(&format!("{:>width$}  ", machine, width = col_widths[j]));
     }
     out.push_str(&format!("{:>total_width$}\n", "total"));

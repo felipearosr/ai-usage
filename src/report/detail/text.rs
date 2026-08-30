@@ -71,9 +71,14 @@ fn render_window(out: &mut String, window: &WindowDetail, now: u64) {
     if !window.machines.is_empty() {
         out.push_str("  by machine\n");
         for share in &window.machines {
+            let name = if share.stale {
+                format!("{} STALE", share.name)
+            } else {
+                share.name.clone()
+            };
             out.push_str(&format!(
                 "    {:<18} {:>8}  {:>5.1}%\n",
-                share.name,
+                name,
                 humanize_tokens(share.output_tokens),
                 share.share_percent
             ));

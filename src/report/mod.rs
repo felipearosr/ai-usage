@@ -7,6 +7,7 @@
 
 pub mod breakdown;
 pub mod detail;
+pub mod fleet;
 pub mod json;
 pub mod text;
 

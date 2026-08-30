@@ -52,6 +52,8 @@ pub struct Matrix {
     /// device id; the friendly name is display only, so two machines sharing
     /// a name stay distinguishable downstream.
     pub machine_ids: Vec<String>,
+    /// Staleness flags parallel to [`Matrix::machines`].
+    pub machine_stale: Vec<bool>,
     /// `cells[model][machine]` output tokens within this window.
     pub cells: Vec<Vec<i64>>,
 }
@@ -117,6 +119,7 @@ impl Matrix {
                 name: name.clone(),
                 output_tokens: self.machine_total(j),
                 share_percent: crate::report::detail::share_percent(self.machine_total(j), grand),
+                stale: self.machine_stale[j],
             })
             .collect()
     }
@@ -131,6 +134,7 @@ impl Matrix {
                 name: self.models[i].clone(),
                 output_tokens: self.cells[i][machine],
                 share_percent: crate::report::detail::share_percent(self.cells[i][machine], total),
+                stale: false,
             })
             .collect()
     }
@@ -150,7 +154,7 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         let matrix = match span {
             Some(span) => {
                 let cutoff = utc::format_epoch(now_epoch.saturating_sub(span));
-                matrix(conn, source, &cutoff)?
+                matrix(conn, source, &cutoff, now_epoch)?
             }
             None => Matrix::default(),
         };
@@ -185,22 +189,25 @@ fn matrix(
     conn: &rusqlite::Connection,
     source: &str,
     cutoff_utc: &str,
+    now_epoch: u64,
 ) -> crate::error::Result<Matrix> {
     let mut stmt = conn.prepare(
-        "SELECT e.exact_model, e.device_id, d.friendly_name, SUM(e.output_tokens)
+        "SELECT e.exact_model, e.device_id, d.friendly_name, SUM(e.output_tokens),
+                d.last_sync_at_utc
          FROM usage_events e
          JOIN devices d ON d.device_id = e.device_id
          WHERE e.source = ?1 AND e.ts_utc >= ?2
-         GROUP BY e.exact_model, e.device_id, d.friendly_name
+         GROUP BY e.exact_model, e.device_id, d.friendly_name, d.last_sync_at_utc
          HAVING SUM(e.output_tokens) > 0",
     )?;
     let rows = stmt
         .query_map(params![source, cutoff_utc], |row| {
             Ok((
-                row.get::<_, String>(0)?, // exact_model
-                row.get::<_, String>(1)?, // device_id
-                row.get::<_, String>(2)?, // friendly_name
-                row.get::<_, i64>(3)?,    // output tokens
+                row.get::<_, String>(0)?,         // exact_model
+                row.get::<_, String>(1)?,         // device_id
+                row.get::<_, String>(2)?,         // friendly_name
+                row.get::<_, i64>(3)?,            // output tokens
+                row.get::<_, Option<String>>(4)?, // last sync
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -208,11 +215,15 @@ fn matrix(
     let mut model_totals: BTreeMap<String, i64> = BTreeMap::new();
     let mut machine_names: BTreeMap<String, String> = BTreeMap::new();
     let mut machine_totals: BTreeMap<String, i64> = BTreeMap::new();
+    let mut machine_last_sync: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut cells: BTreeMap<(String, String), i64> = BTreeMap::new();
-    for (model, device_id, name, tokens) in rows {
+    for (model, device_id, name, tokens, last_sync) in rows {
         *model_totals.entry(model.clone()).or_default() += tokens;
         machine_names.entry(device_id.clone()).or_insert(name);
         *machine_totals.entry(device_id.clone()).or_default() += tokens;
+        machine_last_sync
+            .entry(device_id.clone())
+            .or_insert(last_sync);
         *cells.entry((model, device_id)).or_default() += tokens;
     }
 
@@ -230,6 +241,17 @@ fn matrix(
         .iter()
         .map(|id| machine_names[id].clone())
         .collect();
+    let machine_stale = machine_ids
+        .iter()
+        .map(|id| {
+            machine_last_sync[id]
+                .as_deref()
+                .and_then(utc::parse_rfc3339_utc)
+                .is_some_and(|synced| {
+                    now_epoch.saturating_sub(synced) > crate::report::STALE_AFTER_SECS
+                })
+        })
+        .collect();
 
     let cells = models
         .iter()
@@ -245,6 +267,7 @@ fn matrix(
         models,
         machines,
         machine_ids,
+        machine_stale,
         cells,
     })
 }

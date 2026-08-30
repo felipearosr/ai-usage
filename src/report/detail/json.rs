@@ -42,10 +42,24 @@ fn window_json(window: &WindowDetail, now: u64) -> serde_json::Value {
         "vendor": vendor,
         "attribution": {
             "total_output_tokens": total,
-            "machines": shares_json(&window.machines),
+            "machines": machine_shares_json(&window.machines),
             "models": shares_json(&window.models),
         },
     })
+}
+
+fn machine_shares_json(shares: &[crate::report::detail::Share]) -> Vec<serde_json::Value> {
+    shares
+        .iter()
+        .map(|share| {
+            json!({
+                "name": share.name,
+                "output_tokens": share.output_tokens,
+                "share_percent": share.share_percent,
+                "stale": share.stale,
+            })
+        })
+        .collect()
 }
 
 fn shares_json(shares: &[crate::report::detail::Share]) -> Vec<serde_json::Value> {

@@ -113,6 +113,7 @@ fn map_error(error: ureq::Error) -> PairingRelayError {
 #[derive(Serialize)]
 struct RegisterWorkspace<'a> {
     workspace_id: &'a str,
+    device_id: &'a str,
     device_credential: &'a str,
 }
 
@@ -158,10 +159,17 @@ struct DownloadRecords<'a> {
     limit: usize,
 }
 
+#[derive(Serialize)]
+struct RevokeDevice<'a> {
+    workspace_id: &'a str,
+    device_id: &'a str,
+}
+
 impl PairingRelay for HttpRelayClient {
     fn register_workspace(
         &mut self,
         workspace_id: &str,
+        device_id: &str,
         device_credential: &str,
     ) -> Result<(), PairingRelayError> {
         self.post_empty(
@@ -169,6 +177,7 @@ impl PairingRelay for HttpRelayClient {
             None,
             &RegisterWorkspace {
                 workspace_id,
+                device_id,
                 device_credential,
             },
         )
@@ -281,6 +290,23 @@ impl RelayClient for HttpRelayClient {
                 workspace_id,
                 after_cursor,
                 limit,
+            },
+        )
+        .map_err(map_sync_error)
+    }
+
+    fn revoke_device(
+        &mut self,
+        device_credential: &str,
+        workspace_id: &str,
+        device_id: &str,
+    ) -> Result<(), RelayError> {
+        self.post_empty(
+            "/v1/devices/revoke",
+            Some(device_credential),
+            &RevokeDevice {
+                workspace_id,
+                device_id,
             },
         )
         .map_err(map_sync_error)

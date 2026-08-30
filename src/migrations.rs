@@ -159,4 +159,14 @@ pub const MIGRATIONS: &[&str] = &[
         applied_at_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
     );
     ",
+    // v4 — version friendly-name/OS metadata independently from sync
+    // freshness so a later heartbeat cannot undo a rename.
+    "
+    ALTER TABLE devices ADD COLUMN metadata_updated_at_utc TEXT;
+    ALTER TABLE devices ADD COLUMN metadata_version INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE devices ADD COLUMN revoked_at_utc TEXT;
+    UPDATE devices
+       SET metadata_updated_at_utc = created_at_utc
+     WHERE metadata_updated_at_utc IS NULL;
+    ",
 ];
