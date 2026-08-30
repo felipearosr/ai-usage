@@ -46,6 +46,7 @@ pub enum Command {
     MachineRemove {
         device: String,
     },
+    Sync,
     Init,
     Join {
         code: String,
@@ -86,6 +87,7 @@ USAGE:
     aiu machine rename <device> <name>
                                     rename a machine across the workspace
     aiu machine remove <device>     revoke a machine without deleting history
+    aiu sync                        collect and synchronize now
     aiu init                        create a workspace and pairing code
     aiu join <code>                 join an existing workspace
 
@@ -136,6 +138,10 @@ where
 
     match positionals.as_slice() {
         [] => Ok(Command::Report { json }),
+        [command] if command == "sync" && !json => Ok(Command::Sync),
+        [command, ..] if command == "sync" => Err(ArgsError(format!(
+            "invalid sync command\nusage: aiu sync\n\n{USAGE}"
+        ))),
         [command] if command == "init" && !json => Ok(Command::Init),
         [command, code] if command == "join" && !json => Ok(Command::Join { code: code.clone() }),
         [command, ..] if command == "init" || command == "join" => Err(ArgsError(format!(
@@ -223,6 +229,12 @@ mod tests {
     #[test]
     fn no_args_means_text_report() {
         assert_eq!(parse(args(&[])).unwrap(), Command::Report { json: false });
+    }
+
+    #[test]
+    fn sync_is_recognized() {
+        assert_eq!(parse(args(&["sync"])).unwrap(), Command::Sync);
+        assert!(parse(args(&["sync", "--json"])).is_err());
     }
 
     #[test]

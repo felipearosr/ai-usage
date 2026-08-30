@@ -38,7 +38,9 @@ pub struct DeviceSyncState {
     pub metadata_updated_at_utc: String,
     pub metadata_version: i64,
     pub last_sync_at_utc: Option<String>,
-    pub sources: Vec<String>,
+    /// `None` for a metadata-only update such as a remote rename. Heartbeats
+    /// from the device itself carry its authoritative tracked-source list.
+    pub sources: Option<Vec<String>>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -210,7 +212,7 @@ impl Store {
             metadata_updated_at_utc,
             metadata_version,
             last_sync_at_utc: sync_at_utc.map(str::to_string).or(stored_sync),
-            sources: self.device_sources(device_id)?,
+            sources: Some(self.device_sources(device_id)?),
         })
     }
 
@@ -258,15 +260,17 @@ impl Store {
                 device.metadata_version,
             ],
         )?;
-        self.conn.execute(
-            "DELETE FROM device_sources WHERE device_id = ?1",
-            rusqlite::params![device.device_id],
-        )?;
-        for source in &device.sources {
+        if let Some(sources) = &device.sources {
             self.conn.execute(
-                "INSERT OR IGNORE INTO device_sources (device_id, source) VALUES (?1, ?2)",
-                rusqlite::params![device.device_id, source],
+                "DELETE FROM device_sources WHERE device_id = ?1",
+                rusqlite::params![device.device_id],
             )?;
+            for source in sources {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO device_sources (device_id, source) VALUES (?1, ?2)",
+                    rusqlite::params![device.device_id, source],
+                )?;
+            }
         }
         Ok(())
     }

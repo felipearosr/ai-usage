@@ -78,7 +78,8 @@ pub fn rename_machine(
     }
     let device_id = resolve_device(store, device)?;
     store.rename_device(&device_id, new_name, &crate::utc::now_rfc3339())?;
-    let state = store.device_sync_state(workspace_id, &device_id, None)?;
+    let mut state = store.device_sync_state(workspace_id, &device_id, None)?;
+    state.sources = None;
     enqueue_record(store, &SyncRecord::DeviceState(Box::new(state)))?;
     Ok(device_id)
 }

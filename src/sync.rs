@@ -265,8 +265,9 @@ pub fn enqueue_record(
     store.enqueue_sync_record(&local_record_id(&payload), kind, &payload)
 }
 
-/// Uploads the durable outbox, then downloads and applies one cursor page.
-/// Outbox rows are marked sent only after the relay accepts the whole batch.
+/// Uploads the durable outbox, then downloads and applies every available
+/// cursor page. Outbox rows are marked sent only after the relay accepts the
+/// whole batch.
 pub fn sync_once(
     store: &crate::store::Store,
     relay: &mut dyn RelayClient,
@@ -274,34 +275,41 @@ pub fn sync_once(
 ) -> Result<SyncSummary> {
     let uploaded = upload_pending(store, relay, config)?;
 
-    let cursor = store.sync_cursor()?;
-    let batch = relay.download(
-        &config.device_credential,
-        &config.workspace_id,
-        cursor.as_deref(),
-        config.download_limit.max(1),
-    )?;
     let mut summary = SyncSummary {
         uploaded,
         ..SyncSummary::default()
     };
-    for encrypted_record in &batch.records {
-        if encrypted_record.workspace_id != config.workspace_id {
-            return Err(SyncError::WorkspaceMismatch);
+    let download_limit = config.download_limit.max(1);
+    loop {
+        let cursor = store.sync_cursor()?;
+        let batch = relay.download(
+            &config.device_credential,
+            &config.workspace_id,
+            cursor.as_deref(),
+            download_limit,
+        )?;
+        let record_count = batch.records.len();
+        for encrypted_record in &batch.records {
+            if encrypted_record.workspace_id != config.workspace_id {
+                return Err(SyncError::WorkspaceMismatch);
+            }
+            if store.sync_record_applied(&encrypted_record.record_id)? {
+                summary.duplicates_ignored += 1;
+                continue;
+            }
+            let record = decrypt_record(&config.key, encrypted_record)?;
+            if !record.belongs_to(&config.workspace_id) {
+                return Err(SyncError::WorkspaceMismatch);
+            }
+            apply_record(store, &record, &config.device_id)?;
+            store.mark_sync_record_applied(&encrypted_record.record_id)?;
+            summary.downloaded += 1;
         }
-        if store.sync_record_applied(&encrypted_record.record_id)? {
-            summary.duplicates_ignored += 1;
-            continue;
+        store.set_sync_cursor(&batch.cursor)?;
+        if record_count < download_limit {
+            break;
         }
-        let record = decrypt_record(&config.key, encrypted_record)?;
-        if !record.belongs_to(&config.workspace_id) {
-            return Err(SyncError::WorkspaceMismatch);
-        }
-        apply_record(store, &record)?;
-        store.mark_sync_record_applied(&encrypted_record.record_id)?;
-        summary.downloaded += 1;
     }
-    store.set_sync_cursor(&batch.cursor)?;
     let sync_at = crate::utc::now_rfc3339();
     let device =
         store.device_sync_state(&config.workspace_id, &config.device_id, Some(&sync_at))?;
@@ -339,7 +347,11 @@ fn upload_pending(
     Ok(encrypted.len())
 }
 
-fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> {
+fn apply_record(
+    store: &crate::store::Store,
+    record: &SyncRecord,
+    local_device_id: &str,
+) -> Result<()> {
     match record {
         SyncRecord::UsageEvent(event) => {
             ensure_device(store, &event.device_id)?;
@@ -349,7 +361,15 @@ fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> 
             ensure_device(store, &snapshot.observing_device_id)?;
             store.record_snapshot_if_changed(snapshot)?;
         }
-        SyncRecord::DeviceState(device) => store.apply_device_sync_state(device)?,
+        SyncRecord::DeviceState(device) => {
+            if device.device_id == local_device_id {
+                let mut device = (**device).clone();
+                device.sources = None;
+                store.apply_device_sync_state(&device)?;
+            } else {
+                store.apply_device_sync_state(device)?;
+            }
+        }
         SyncRecord::DeviceRevocation(device) => {
             store.mark_device_revoked(&device.device_id, &device.revoked_at_utc)?
         }

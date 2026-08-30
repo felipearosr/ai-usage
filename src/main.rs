@@ -55,6 +55,11 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Sync) => {
+            if let Err(e) = run_sync() {
+                die(1, e);
+            }
+        }
         Ok(Command::Init) => {
             if let Err(e) = run_init() {
                 die(1, e);
@@ -80,15 +85,26 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 }
 
 fn run_machines(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
-    quick_collect(&store)?;
-    sync_before_report(&store);
+    let store = refreshed_store()?;
     let report = report::fleet::build(&store, aiu::utc::now_epoch())?;
     if json {
         println!("{}", report::fleet::render_json(&report));
     } else {
         print!("{}", report::fleet::render_text(&report));
     }
+    Ok(())
+}
+
+fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    quick_collect(&store)?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    let summary = aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!(
+        "Synced: {} uploaded, {} downloaded, {} duplicates ignored.",
+        summary.uploaded, summary.downloaded, summary.duplicates_ignored
+    );
     Ok(())
 }
 
@@ -242,9 +258,7 @@ fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
-    quick_collect(&store)?;
-    sync_before_report(&store);
+    let store = refreshed_store()?;
     let report = report::build(&store, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", report::json::render(&report));
@@ -255,9 +269,7 @@ fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_detail(source: &str, json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
-    quick_collect(&store)?;
-    sync_before_report(&store);
+    let store = refreshed_store()?;
     let detail = detail::build(&store, source, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", detail::json::render(&detail));
@@ -272,9 +284,7 @@ fn run_breakdown(
     kind: BreakdownKind,
     json_format: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
-    quick_collect(&store)?;
-    sync_before_report(&store);
+    let store = refreshed_store()?;
     let breakdown = breakdown::build(&store, source, aiu::utc::now_epoch())?;
     match (kind, json_format) {
         (BreakdownKind::Models, true) => print!("{}", breakdown::json::render_matrix(&breakdown)),
@@ -287,6 +297,13 @@ fn run_breakdown(
         }
     }
     Ok(())
+}
+
+fn refreshed_store() -> Result<Store, Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    quick_collect(&store)?;
+    sync_before_report(&store);
+    Ok(store)
 }
 
 fn sync_before_report(store: &Store) {

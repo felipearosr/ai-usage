@@ -21,6 +21,8 @@ struct FakeRelay {
     ids: HashSet<(String, String)>,
     unavailable: bool,
     download_failures: usize,
+    fail_download_on_call: Option<usize>,
+    download_calls: usize,
     revoked_credentials: HashSet<String>,
 }
 
@@ -48,11 +50,16 @@ impl RelayClient for FakeRelay {
         after_cursor: Option<&str>,
         limit: usize,
     ) -> Result<DownloadBatch, RelayError> {
+        let call = self.download_calls;
+        self.download_calls += 1;
         if self.unavailable {
             return Err(RelayError::Unavailable);
         }
         if self.download_failures > 0 {
             self.download_failures -= 1;
+            return Err(RelayError::Unavailable);
+        }
+        if self.fail_download_on_call == Some(call) {
             return Err(RelayError::Unavailable);
         }
         if self.revoked_credentials.contains(credential) {
@@ -326,6 +333,7 @@ fn rename_propagates_and_old_device_heartbeats_cannot_undo_it() {
     sync_once(&second, &mut relay, &config("device-b")).unwrap();
     sync_once(&first, &mut relay, &config("device-a")).unwrap();
 
+    second.set_device_source("device-b", "go", true).unwrap();
     aiu::fleet::rename_machine(&first, "workspace-opaque", "device-b", "studio").unwrap();
     sync_once(&first, &mut relay, &config("device-a")).unwrap();
     sync_once(&second, &mut relay, &config("device-b")).unwrap();
@@ -341,6 +349,15 @@ fn rename_propagates_and_old_device_heartbeats_cannot_undo_it() {
             .machines
             .iter()
             .any(|machine| machine.name == "builder"));
+        assert_eq!(
+            fleet
+                .machines
+                .iter()
+                .find(|machine| machine.name == "studio")
+                .unwrap()
+                .sources,
+            vec!["go"]
+        );
     }
 }
 
@@ -519,20 +536,17 @@ fn download_resumes_from_its_cursor_after_interruption() {
     let mut settings = config("device-a");
     settings.download_limit = 1;
 
-    assert_eq!(
-        sync_once(&store, &mut relay, &settings).unwrap().downloaded,
-        1
-    );
-    relay.download_failures = 1;
+    relay.fail_download_on_call = Some(1);
     assert!(matches!(
         sync_once(&store, &mut relay, &settings),
         Err(SyncError::Relay(RelayError::Unavailable))
     ));
+    let fleet = aiu::report::fleet::build(&store, aiu::utc::now_epoch()).unwrap();
+    assert!(fleet.machines[0].last_sync_at_utc.is_none());
     assert_eq!(
         sync_once(&store, &mut relay, &settings).unwrap().downloaded,
         1
     );
-    while sync_once(&store, &mut relay, &settings).unwrap().downloaded > 0 {}
     assert!(!store.record_event(&event("remote-1", "device-a")).unwrap());
     assert!(!store.record_event(&event("remote-2", "device-a")).unwrap());
 }
