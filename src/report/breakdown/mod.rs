@@ -54,6 +54,8 @@ pub struct Matrix {
     pub machine_ids: Vec<String>,
     /// Staleness flags parallel to [`Matrix::machines`].
     pub machine_stale: Vec<bool>,
+    /// Last successful sync timestamps parallel to [`Matrix::machines`].
+    pub machine_last_sync_at_utc: Vec<Option<String>>,
     /// `cells[model][machine]` output tokens within this window.
     pub cells: Vec<Vec<i64>>,
 }
@@ -120,6 +122,7 @@ impl Matrix {
                 output_tokens: self.machine_total(j),
                 share_percent: crate::report::detail::share_percent(self.machine_total(j), grand),
                 stale: self.machine_stale[j],
+                last_sync_at_utc: self.machine_last_sync_at_utc[j].clone(),
             })
             .collect()
     }
@@ -135,6 +138,7 @@ impl Matrix {
                 output_tokens: self.cells[i][machine],
                 share_percent: crate::report::detail::share_percent(self.cells[i][machine], total),
                 stale: false,
+                last_sync_at_utc: None,
             })
             .collect()
     }
@@ -163,6 +167,9 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
             vendor: Some(VendorQuota {
                 used_percent: quota.used_percent,
                 resets_at_utc: quota.resets_at_utc,
+                observed_at_utc: quota.observed_at_utc,
+                observing_device_name: quota.observing_device_name,
+                observer_last_sync_at_utc: quota.observer_last_sync_at_utc,
             }),
             matrix,
         });
@@ -241,16 +248,13 @@ fn matrix(
         .iter()
         .map(|id| machine_names[id].clone())
         .collect();
-    let machine_stale = machine_ids
+    let machine_last_sync_at_utc = machine_ids
         .iter()
-        .map(|id| {
-            machine_last_sync[id]
-                .as_deref()
-                .and_then(utc::parse_rfc3339_utc)
-                .is_some_and(|synced| {
-                    now_epoch.saturating_sub(synced) > crate::report::STALE_AFTER_SECS
-                })
-        })
+        .map(|id| machine_last_sync[id].clone())
+        .collect::<Vec<_>>();
+    let machine_stale = machine_last_sync_at_utc
+        .iter()
+        .map(|last_sync| crate::report::is_stale_at(last_sync.as_deref(), now_epoch))
         .collect();
 
     let cells = models
@@ -268,6 +272,7 @@ fn matrix(
         machines,
         machine_ids,
         machine_stale,
+        machine_last_sync_at_utc,
         cells,
     })
 }

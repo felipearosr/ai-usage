@@ -58,6 +58,9 @@ pub struct WindowDetail {
 pub struct VendorQuota {
     pub used_percent: f64,
     pub resets_at_utc: Option<String>,
+    pub observed_at_utc: String,
+    pub observing_device_name: String,
+    pub observer_last_sync_at_utc: Option<String>,
 }
 
 impl VendorQuota {
@@ -68,6 +71,16 @@ impl VendorQuota {
             .filter(|resets| *resets > now_epoch)
             .map(|resets| resets - now_epoch)
     }
+
+    pub fn observation_age_secs(&self, now_epoch: u64) -> Option<u64> {
+        crate::report::sync_age_secs(Some(&self.observed_at_utc), now_epoch)
+    }
+
+    pub fn is_stale(&self, now_epoch: u64) -> bool {
+        self.observation_age_secs(now_epoch)
+            .is_none_or(|age| age > crate::report::STALE_AFTER_SECS)
+            || crate::report::is_stale_at(self.observer_last_sync_at_utc.as_deref(), now_epoch)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -76,6 +89,7 @@ pub struct Share {
     pub output_tokens: i64,
     pub share_percent: f64,
     pub stale: bool,
+    pub last_sync_at_utc: Option<String>,
 }
 
 /// Builds the detail view through the same queries the CLI renders.
@@ -124,6 +138,9 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
             vendor: Some(VendorQuota {
                 used_percent: quota.used_percent,
                 resets_at_utc: quota.resets_at_utc,
+                observed_at_utc: quota.observed_at_utc,
+                observing_device_name: quota.observing_device_name,
+                observer_last_sync_at_utc: quota.observer_last_sync_at_utc,
             }),
             machines,
             models,
@@ -160,6 +177,7 @@ fn shares(
             name,
             output_tokens: tokens,
             stale: false,
+            last_sync_at_utc: None,
         })
         .collect())
 }
@@ -185,12 +203,8 @@ fn machine_shares(
     Ok(rows
         .into_iter()
         .map(|(name, tokens, last_sync)| Share {
-            stale: last_sync
-                .as_deref()
-                .and_then(utc::parse_rfc3339_utc)
-                .is_some_and(|synced| {
-                    now_epoch.saturating_sub(synced) > crate::report::STALE_AFTER_SECS
-                }),
+            stale: crate::report::is_stale_at(last_sync.as_deref(), now_epoch),
+            last_sync_at_utc: last_sync,
             share_percent: share_percent(tokens, total),
             name,
             output_tokens: tokens,

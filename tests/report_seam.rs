@@ -280,12 +280,66 @@ fn account_quota_observations_from_multiple_devices_are_not_summed() {
     );
 }
 
+#[test]
+fn quota_observed_by_a_stale_device_is_not_presented_as_current() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", Some(31 * 60));
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "codex".into(),
+            window: "5h".into(),
+            used_percent: 43.0,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 31 * 60),
+            observing_device_id: "dev-laptop".into(),
+        })
+        .unwrap();
+
+    let report = report::build(&store, NOW).unwrap();
+    let compact = text::render(&report);
+    assert!(compact.contains("43.0% used · STALE"), "{compact}");
+    assert!(compact.contains("observed 31m ago by laptop"), "{compact}");
+
+    let detail = detail::build(&store, "codex", NOW).unwrap();
+    let detail_text = detail::text::render(&detail);
+    assert!(detail_text.contains("43.0% used · STALE"), "{detail_text}");
+    let json: serde_json::Value = serde_json::from_str(&detail::json::render(&detail)).unwrap();
+    assert_eq!(json["windows"][0]["vendor"]["stale"], true);
+}
+
+#[test]
+fn identical_quota_seen_by_a_fresh_device_refreshes_observation_without_summing() {
+    let store = harness();
+    device(&store, "dev-stale", "oldbox", Some(31 * 60));
+    device(&store, "dev-fresh", "laptop", Some(60));
+    let stale = NewSnapshot {
+        source: "codex".into(),
+        window: "5h".into(),
+        used_percent: 43.0,
+        resets_at_utc: None,
+        observed_at_utc: utc::format_epoch(NOW - 31 * 60),
+        observing_device_id: "dev-stale".into(),
+    };
+    let mut fresh = stale.clone();
+    fresh.observed_at_utc = utc::format_epoch(NOW - 60);
+    fresh.observing_device_id = "dev-fresh".into();
+    assert!(store.record_snapshot_if_changed(&stale).unwrap());
+    assert!(!store.record_snapshot_if_changed(&fresh).unwrap());
+
+    let report = report::build(&store, NOW).unwrap();
+    let window = &report.sources[0].windows[0];
+    assert_eq!(window.used_percent, 43.0);
+    assert_eq!(window.observing_device_name, "laptop");
+    assert!(!window.is_stale(NOW));
+}
+
 // ---- Compact default command (issue 05) -----------------------------------
 
 /// Extracts the text block belonging to one source, from its header line to
 /// the next blank line, so per-source assertions stay scoped.
 fn block<'a>(out: &'a str, source: &str) -> &'a str {
-    let start = out.find(source).expect("source block present");
+    let header = format!("\n{source}\n");
+    let start = out.find(&header).expect("source block present") + 1;
     let rest = &out[start..];
     match rest.find("\n\n") {
         Some(end) => &rest[..end],
@@ -319,6 +373,20 @@ fn compact_layout_has_ai_usage_header_top_lines_and_sync_section() {
     assert!(out.contains("synced 2m ago"));
     assert!(out.contains("top machine  laptop"));
     assert!(out.contains("top model    claude-opus-5"));
+}
+
+#[test]
+fn stale_top_machine_is_marked_on_the_compact_attribution_line() {
+    let store = harness();
+    device(&store, "dev-laptop", "desktop", Some(31 * 60));
+    snapshot(&store, "claude", "5h", 42.5, None);
+    event(&store, "e1", "dev-laptop", "claude", "claude-opus-5", 100);
+
+    let report = report::build(&store, NOW).unwrap();
+    let text = text::render(&report);
+    assert!(text.contains("top machine  desktop STALE"), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&report::json::render(&report)).unwrap();
+    assert_eq!(json["sources"][0]["top_machine"]["stale"], true);
 }
 
 #[test]
@@ -572,6 +640,7 @@ fn stale_participating_machine_is_marked_in_every_detailed_view() {
     let detail = detail::build(&store, "claude", NOW).unwrap();
     let detail_text = detail::text::render(&detail);
     assert!(detail_text.contains("desktop STALE"), "{detail_text}");
+    assert!(detail_text.contains("31m ago"), "{detail_text}");
     let detail_json: serde_json::Value =
         serde_json::from_str(&detail::json::render(&detail)).unwrap();
     let desktop = detail_json["windows"][0]["attribution"]["machines"]
@@ -596,6 +665,20 @@ fn stale_participating_machine_is_marked_in_every_detailed_view() {
         .find(|machine| machine["name"] == "desktop")
         .unwrap();
     assert_eq!(desktop["stale"], true);
+}
+
+#[test]
+fn never_synced_participating_machine_is_explicit_in_detailed_views() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop", None);
+    snapshot(&store, "claude", "5h", 10.0, None);
+    event(&store, "e1", "dev-laptop", "claude", "claude-opus-5", 5);
+
+    let detail = detail::build(&store, "claude", NOW).unwrap();
+    let text = detail::text::render(&detail);
+    assert!(text.contains("laptop (never synced)"), "{text}");
+    let json: serde_json::Value = serde_json::from_str(&detail::json::render(&detail)).unwrap();
+    assert!(json["windows"][0]["attribution"]["machines"][0]["last_sync_at"].is_null());
 }
 
 #[test]

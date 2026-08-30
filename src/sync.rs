@@ -272,31 +272,7 @@ pub fn sync_once(
     relay: &mut dyn RelayClient,
     config: &SyncConfig,
 ) -> Result<SyncSummary> {
-    let sync_at = crate::utc::now_rfc3339();
-    let device =
-        store.device_sync_state(&config.workspace_id, &config.device_id, Some(&sync_at))?;
-    enqueue_record(store, &SyncRecord::DeviceState(Box::new(device)))?;
-    let pending = store.pending_sync_records()?;
-    let encrypted = pending
-        .iter()
-        .map(|item| {
-            let record: SyncRecord = serde_json::from_slice(&item.payload)?;
-            if !record.belongs_to(&config.workspace_id) {
-                return Err(SyncError::WorkspaceMismatch);
-            }
-            encrypt_record(&config.workspace_id, &config.key, &record)
-        })
-        .collect::<Result<Vec<_>>>()?;
-
-    if !encrypted.is_empty() {
-        relay.upload(&config.device_credential, &encrypted)?;
-        let ids = pending
-            .iter()
-            .map(|item| item.outbox_id)
-            .collect::<Vec<_>>();
-        store.mark_sync_records_sent(&ids)?;
-        store.touch_device_sync(&config.device_id, &sync_at)?;
-    }
+    let uploaded = upload_pending(store, relay, config)?;
 
     let cursor = store.sync_cursor()?;
     let batch = relay.download(
@@ -306,7 +282,7 @@ pub fn sync_once(
         config.download_limit.max(1),
     )?;
     let mut summary = SyncSummary {
-        uploaded: encrypted.len(),
+        uploaded,
         ..SyncSummary::default()
     };
     for encrypted_record in &batch.records {
@@ -326,7 +302,41 @@ pub fn sync_once(
         summary.downloaded += 1;
     }
     store.set_sync_cursor(&batch.cursor)?;
+    let sync_at = crate::utc::now_rfc3339();
+    let device =
+        store.device_sync_state(&config.workspace_id, &config.device_id, Some(&sync_at))?;
+    enqueue_record(store, &SyncRecord::DeviceState(Box::new(device)))?;
+    summary.uploaded += upload_pending(store, relay, config)?;
+    store.touch_device_sync(&config.device_id, &sync_at)?;
     Ok(summary)
+}
+
+fn upload_pending(
+    store: &crate::store::Store,
+    relay: &mut dyn RelayClient,
+    config: &SyncConfig,
+) -> Result<usize> {
+    let pending = store.pending_sync_records()?;
+    let encrypted = pending
+        .iter()
+        .map(|item| {
+            let record: SyncRecord = serde_json::from_slice(&item.payload)?;
+            if !record.belongs_to(&config.workspace_id) {
+                return Err(SyncError::WorkspaceMismatch);
+            }
+            encrypt_record(&config.workspace_id, &config.key, &record)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if encrypted.is_empty() {
+        return Ok(0);
+    }
+    relay.upload(&config.device_credential, &encrypted)?;
+    let ids = pending
+        .iter()
+        .map(|item| item.outbox_id)
+        .collect::<Vec<_>>();
+    store.mark_sync_records_sent(&ids)?;
+    Ok(encrypted.len())
 }
 
 fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> {

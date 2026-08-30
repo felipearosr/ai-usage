@@ -168,5 +168,15 @@ pub const MIGRATIONS: &[&str] = &[
     UPDATE devices
        SET metadata_updated_at_utc = created_at_utc
      WHERE metadata_updated_at_utc IS NULL;
+
+    CREATE TABLE device_sources (
+        device_id TEXT NOT NULL REFERENCES devices(device_id),
+        source    TEXT NOT NULL,
+        PRIMARY KEY (device_id, source)
+    );
+    INSERT OR IGNORE INTO device_sources (device_id, source)
+    SELECT device_id, source FROM usage_events
+    UNION
+    SELECT observing_device_id, source FROM quota_snapshots;
     ",
 ];

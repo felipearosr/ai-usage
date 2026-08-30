@@ -34,6 +34,7 @@ pub struct SourceReport {
     pub top_model: Option<Attribution>,
     /// Top participating machine by output tokens for this source only.
     pub top_machine: Option<Attribution>,
+    pub top_machine_stale: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -41,6 +42,9 @@ pub struct WindowQuota {
     pub window: String,
     pub used_percent: f64,
     pub resets_at_utc: Option<String>,
+    pub observed_at_utc: String,
+    pub observing_device_name: String,
+    pub observer_last_sync_at_utc: Option<String>,
 }
 
 impl WindowQuota {
@@ -52,6 +56,16 @@ impl WindowQuota {
             .and_then(crate::utc::parse_rfc3339_utc)
             .filter(|resets| *resets > now_epoch)
             .map(|resets| resets - now_epoch)
+    }
+
+    pub fn observation_age_secs(&self, now_epoch: u64) -> Option<u64> {
+        sync_age_secs(Some(&self.observed_at_utc), now_epoch)
+    }
+
+    pub fn is_stale(&self, now_epoch: u64) -> bool {
+        self.observation_age_secs(now_epoch)
+            .is_none_or(|age| age > STALE_AFTER_SECS)
+            || is_stale_at(self.observer_last_sync_at_utc.as_deref(), now_epoch)
     }
 }
 
@@ -69,23 +83,43 @@ pub struct DeviceFreshness {
 
 impl DeviceFreshness {
     pub fn is_stale(&self, now_epoch: u64) -> bool {
-        match self
-            .last_sync_at_utc
-            .as_deref()
-            .and_then(crate::utc::parse_rfc3339_utc)
-        {
-            Some(synced) => now_epoch.saturating_sub(synced) > STALE_AFTER_SECS,
-            // A device that has never synced is not "silent past 30 minutes";
-            // it is simply unsynced, and renders as such (never STALE).
-            None => false,
-        }
+        is_stale_at(self.last_sync_at_utc.as_deref(), now_epoch)
     }
 
     pub fn age_secs(&self, now_epoch: u64) -> Option<u64> {
-        self.last_sync_at_utc
-            .as_deref()
-            .and_then(crate::utc::parse_rfc3339_utc)
-            .map(|synced| now_epoch.saturating_sub(synced))
+        sync_age_secs(self.last_sync_at_utc.as_deref(), now_epoch)
+    }
+}
+
+pub(crate) fn sync_age_secs(last_sync_at_utc: Option<&str>, now_epoch: u64) -> Option<u64> {
+    last_sync_at_utc
+        .and_then(crate::utc::parse_rfc3339_utc)
+        .map(|synced| now_epoch.saturating_sub(synced))
+}
+
+pub(crate) fn is_stale_at(last_sync_at_utc: Option<&str>, now_epoch: u64) -> bool {
+    sync_age_secs(last_sync_at_utc, now_epoch).is_some_and(|age| age > STALE_AFTER_SECS)
+}
+
+pub(crate) fn humanize_sync_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        "now".to_string()
+    } else {
+        format!("{} ago", crate::utc::humanize_duration_secs(age_secs))
+    }
+}
+
+pub(crate) fn machine_freshness_label(
+    name: &str,
+    last_sync_at_utc: Option<&str>,
+    now_epoch: u64,
+) -> String {
+    match sync_age_secs(last_sync_at_utc, now_epoch) {
+        Some(age) if age > STALE_AFTER_SECS => {
+            format!("{name} STALE ({})", humanize_sync_age(age))
+        }
+        Some(age) => format!("{name} ({})", humanize_sync_age(age)),
+        None => format!("{name} (never synced)"),
     }
 }
 
@@ -98,7 +132,7 @@ pub fn build(store: &Store, now_epoch: u64) -> crate::error::Result<Report> {
         let names = store.configured_sources()?;
         let mut reports = Vec::new();
         for source in names {
-            reports.push(source_report(conn, &source)?);
+            reports.push(source_report(conn, &source, now_epoch)?);
         }
         reports
     };
@@ -125,7 +159,11 @@ pub fn build(store: &Store, now_epoch: u64) -> crate::error::Result<Report> {
     })
 }
 
-fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Result<SourceReport> {
+fn source_report(
+    conn: &rusqlite::Connection,
+    source: &str,
+    now_epoch: u64,
+) -> crate::error::Result<SourceReport> {
     let windows = latest_window_quotas(conn, source)?;
 
     let top_model = attribution(
@@ -144,17 +182,18 @@ fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Res
          LIMIT 1",
     )?;
 
-    let top_machine = attribution(
+    let (top_machine, top_machine_stale) = machine_attribution(
         conn,
         source,
-        "SELECT d.friendly_name, SUM(e.output_tokens)
+        "SELECT d.friendly_name, SUM(e.output_tokens), d.last_sync_at_utc
          FROM usage_events e
          JOIN devices d ON d.device_id = e.device_id
          WHERE e.source = ?1
-         GROUP BY e.device_id, d.friendly_name
+         GROUP BY e.device_id, d.friendly_name, d.last_sync_at_utc
          HAVING SUM(e.output_tokens) > 0
          ORDER BY SUM(e.output_tokens) DESC, d.friendly_name ASC
          LIMIT 1",
+        now_epoch,
     )?;
 
     Ok(SourceReport {
@@ -162,7 +201,31 @@ fn source_report(conn: &rusqlite::Connection, source: &str) -> crate::error::Res
         windows,
         top_model,
         top_machine,
+        top_machine_stale,
     })
+}
+
+fn machine_attribution(
+    conn: &rusqlite::Connection,
+    source: &str,
+    query: &str,
+    now_epoch: u64,
+) -> crate::error::Result<(Option<Attribution>, bool)> {
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = stmt.query(params![source])?;
+    match rows.next()? {
+        Some(row) => {
+            let last_sync_at_utc = row.get::<_, Option<String>>(2)?;
+            Ok((
+                Some(Attribution {
+                    name: row.get(0)?,
+                    output_tokens: row.get(1)?,
+                }),
+                is_stale_at(last_sync_at_utc.as_deref(), now_epoch),
+            ))
+        }
+        None => Ok((None, false)),
+    }
 }
 
 /// True when at least one usage event exists for `source`. Shared by the
@@ -184,8 +247,10 @@ pub(crate) fn latest_window_quotas(
     source: &str,
 ) -> crate::error::Result<Vec<WindowQuota>> {
     let mut stmt = conn.prepare(
-        "SELECT q.window, q.used_percent, q.resets_at_utc
+        "SELECT q.window, q.used_percent, q.resets_at_utc, q.observed_at_utc,
+                d.friendly_name, d.last_sync_at_utc
          FROM quota_snapshots q
+         JOIN devices d ON d.device_id = q.observing_device_id
          WHERE q.source = ?1
            AND q.id = (
                SELECT q2.id FROM quota_snapshots q2
@@ -201,6 +266,9 @@ pub(crate) fn latest_window_quotas(
                 window: row.get(0)?,
                 used_percent: row.get(1)?,
                 resets_at_utc: row.get(2)?,
+                observed_at_utc: row.get(3)?,
+                observing_device_name: row.get(4)?,
+                observer_last_sync_at_utc: row.get(5)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

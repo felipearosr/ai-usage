@@ -20,6 +20,7 @@ fn migrations_apply_from_empty_and_are_idempotent() {
     // Core entities exist after a clean apply.
     for table in [
         "devices",
+        "device_sources",
         "source_config",
         "usage_events",
         "quota_snapshots",

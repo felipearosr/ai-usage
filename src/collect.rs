@@ -165,7 +165,9 @@ pub fn collect_detected_with_progress(
     let mut results = Vec::new();
     for detection in crate::sources::detect(home) {
         let mode = store.source_mode(detection.source)?;
-        if !crate::sources::should_collect(mode, detection.detected) {
+        let tracked = crate::sources::should_collect(mode, detection.detected);
+        store.set_device_source(&ctx.device_id, detection.source, tracked)?;
+        if !tracked {
             continue;
         }
         let Some(adapter) = adapter_for(detection.source) else {

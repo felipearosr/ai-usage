@@ -55,7 +55,7 @@ fn render_matrix_window(out: &mut String, window: &WindowBreakdown, now: u64) {
     }
 
     out.push_str("machine × model matrix (share of window output tokens):\n");
-    render_matrix_table(out, &window.matrix);
+    render_matrix_table(out, &window.matrix, now);
 }
 
 fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) {
@@ -73,11 +73,11 @@ fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) 
         window.window
     ));
     for (j, share) in window.matrix.machine_shares().iter().enumerate() {
-        let name = if share.stale {
-            format!("{} STALE", share.name)
-        } else {
-            share.name.clone()
-        };
+        let name = crate::report::machine_freshness_label(
+            &share.name,
+            share.last_sync_at_utc.as_deref(),
+            now,
+        );
         out.push_str(&format!(
             "  {:<18} {:>8}  {:>5.1}%\n",
             name,
@@ -95,7 +95,7 @@ fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) 
     }
 }
 
-fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matrix) {
+fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matrix, now: u64) {
     let grand = matrix.grand_total();
     let label_width = matrix
         .models
@@ -107,13 +107,9 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
     let machine_labels = matrix
         .machines
         .iter()
-        .zip(&matrix.machine_stale)
-        .map(|(name, stale)| {
-            if *stale {
-                format!("{name} STALE")
-            } else {
-                name.clone()
-            }
+        .zip(&matrix.machine_last_sync_at_utc)
+        .map(|(name, last_sync)| {
+            crate::report::machine_freshness_label(name, last_sync.as_deref(), now)
         })
         .collect::<Vec<_>>();
     let col_widths: Vec<usize> = machine_labels

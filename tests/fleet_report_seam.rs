@@ -70,3 +70,18 @@ fn global_machine_table_shows_os_freshness_sources_and_explicit_gaps() {
     assert!(machines[2]["last_sync_at"].is_null());
     assert!(machines[2]["last_sync_age_secs"].is_null());
 }
+
+#[test]
+fn just_synced_and_missing_os_render_as_explicit_states() {
+    let store = Store::open_in_memory().unwrap();
+    device(&store, "device-a", "laptop", "", Some(0));
+
+    let report = fleet::build(&store, NOW).unwrap();
+    let text = fleet::render_text(&report);
+    assert!(text.contains("now"), "{text}");
+    assert!(text.contains("OS not reported"), "{text}");
+    assert!(!text.contains("0s ago"), "{text}");
+
+    let json: serde_json::Value = serde_json::from_str(&fleet::render_json(&report)).unwrap();
+    assert!(json["machines"][0]["os"].is_null());
+}

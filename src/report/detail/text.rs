@@ -48,6 +48,20 @@ pub(crate) fn vendor_line(vendor: &Option<VendorQuota>, now: u64) -> String {
                     utc::humanize_duration_secs(secs)
                 ));
             }
+            if vendor.is_stale(now) {
+                line.push_str(" · STALE");
+            }
+            let observed = vendor
+                .observation_age_secs(now)
+                .map(crate::report::humanize_sync_age)
+                .unwrap_or_else(|| "at an invalid time".to_string());
+            line.push_str(&format!(
+                " · observed {observed} by {}",
+                vendor.observing_device_name
+            ));
+            if vendor.observer_last_sync_at_utc.is_none() {
+                line.push_str(" (device never synced)");
+            }
             line
         }
         None => "vendor quota: no vendor snapshot yet".to_string(),
@@ -71,11 +85,11 @@ fn render_window(out: &mut String, window: &WindowDetail, now: u64) {
     if !window.machines.is_empty() {
         out.push_str("  by machine\n");
         for share in &window.machines {
-            let name = if share.stale {
-                format!("{} STALE", share.name)
-            } else {
-                share.name.clone()
-            };
+            let name = crate::report::machine_freshness_label(
+                &share.name,
+                share.last_sync_at_utc.as_deref(),
+                now,
+            );
             out.push_str(&format!(
                 "    {:<18} {:>8}  {:>5.1}%\n",
                 name,

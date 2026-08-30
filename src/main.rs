@@ -81,6 +81,8 @@ fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
 
 fn run_machines(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
+    quick_collect(&store)?;
+    sync_before_report(&store);
     let report = report::fleet::build(&store, aiu::utc::now_epoch())?;
     if json {
         println!("{}", report::fleet::render_json(&report));
@@ -242,6 +244,7 @@ fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
 fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
     quick_collect(&store)?;
+    sync_before_report(&store);
     let report = report::build(&store, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", report::json::render(&report));
@@ -253,6 +256,8 @@ fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_detail(source: &str, json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
+    quick_collect(&store)?;
+    sync_before_report(&store);
     let detail = detail::build(&store, source, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", detail::json::render(&detail));
@@ -268,6 +273,8 @@ fn run_breakdown(
     json_format: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
+    quick_collect(&store)?;
+    sync_before_report(&store);
     let breakdown = breakdown::build(&store, source, aiu::utc::now_epoch())?;
     match (kind, json_format) {
         (BreakdownKind::Models, true) => print!("{}", breakdown::json::render_matrix(&breakdown)),
@@ -280,6 +287,26 @@ fn run_breakdown(
         }
     }
     Ok(())
+}
+
+fn sync_before_report(store: &Store) {
+    match aiu::setup::is_initialized(store) {
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("aiu: sync status unavailable; showing local data: {error}");
+            return;
+        }
+        Ok(true) => {}
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let config = aiu::setup::load_sync_config(store, 500)?;
+        let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+        aiu::sync::sync_once(store, &mut relay, &config)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("aiu: sync failed; showing local data: {error}");
+    }
 }
 
 fn run_sources(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {

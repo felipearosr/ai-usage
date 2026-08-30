@@ -1,9 +1,7 @@
 //! Global machine health and source participation report.
 
-use rusqlite::params;
 use serde_json::json;
 
-use crate::report::STALE_AFTER_SECS;
 use crate::store::Store;
 use crate::utc;
 
@@ -25,15 +23,11 @@ pub struct MachineRow {
 
 impl MachineRow {
     pub fn last_sync_age_secs(&self, now_epoch: u64) -> Option<u64> {
-        self.last_sync_at_utc
-            .as_deref()
-            .and_then(utc::parse_rfc3339_utc)
-            .map(|synced| now_epoch.saturating_sub(synced))
+        crate::report::sync_age_secs(self.last_sync_at_utc.as_deref(), now_epoch)
     }
 
     pub fn is_stale(&self, now_epoch: u64) -> bool {
-        self.last_sync_age_secs(now_epoch)
-            .is_some_and(|age| age > STALE_AFTER_SECS)
+        crate::report::is_stale_at(self.last_sync_at_utc.as_deref(), now_epoch)
     }
 }
 
@@ -57,16 +51,7 @@ pub fn build(store: &Store, now_epoch: u64) -> crate::error::Result<FleetReport>
 
     let mut machines = Vec::with_capacity(rows.len());
     for (device_id, name, os, last_sync_at_utc, revoked_at_utc) in rows {
-        let mut sources = store.conn().prepare(
-            "SELECT DISTINCT source FROM (
-                 SELECT source FROM usage_events WHERE device_id = ?1
-                 UNION
-                 SELECT source FROM quota_snapshots WHERE observing_device_id = ?1
-             ) ORDER BY source",
-        )?;
-        let sources = sources
-            .query_map(params![device_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let sources = store.device_sources(&device_id)?;
         machines.push(MachineRow {
             device_id,
             name,
@@ -96,7 +81,7 @@ pub fn render_text(report: &FleetReport) -> String {
     for machine in &report.machines {
         let last_sync = machine
             .last_sync_age_secs(report.generated_at_epoch)
-            .map(|age| format!("{} ago", utc::humanize_duration_secs(age)))
+            .map(crate::report::humanize_sync_age)
             .unwrap_or_else(|| "never synced".to_string());
         let sources = if machine.sources.is_empty() {
             "no tracked sources".to_string()
@@ -114,7 +99,15 @@ pub fn render_text(report: &FleetReport) -> String {
         };
         out.push_str(&format!(
             "{:<18} {:<10} {:<14} {:<24} {}\n",
-            machine.name, machine.os, last_sync, sources, status
+            machine.name,
+            if machine.os.is_empty() {
+                "OS not reported"
+            } else {
+                &machine.os
+            },
+            last_sync,
+            sources,
+            status
         ));
     }
     out
@@ -128,7 +121,11 @@ pub fn render_json(report: &FleetReport) -> String {
             json!({
                 "device_id": machine.device_id,
                 "name": machine.name,
-                "os": machine.os,
+                "os": if machine.os.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    json!(machine.os)
+                },
                 "last_sync_at": machine.last_sync_at_utc,
                 "revoked_at": machine.revoked_at_utc,
                 "removed": machine.revoked_at_utc.is_some(),

@@ -38,6 +38,7 @@ pub struct DeviceSyncState {
     pub metadata_updated_at_utc: String,
     pub metadata_version: i64,
     pub last_sync_at_utc: Option<String>,
+    pub sources: Vec<String>,
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -182,27 +183,35 @@ impl Store {
         device_id: &str,
         sync_at_utc: Option<&str>,
     ) -> Result<DeviceSyncState> {
-        self.conn
-            .query_row(
+        let (friendly_name, os, arch, metadata_updated_at_utc, metadata_version, stored_sync) =
+            self.conn.query_row(
                 "SELECT friendly_name, os, arch,
                         COALESCE(metadata_updated_at_utc, created_at_utc),
                         metadata_version, last_sync_at_utc
                  FROM devices WHERE device_id = ?1",
                 rusqlite::params![device_id],
                 |row| {
-                    Ok(DeviceSyncState {
-                        workspace_id: workspace_id.to_string(),
-                        device_id: device_id.to_string(),
-                        friendly_name: row.get(0)?,
-                        os: row.get(1)?,
-                        arch: row.get(2)?,
-                        metadata_updated_at_utc: row.get(3)?,
-                        metadata_version: row.get(4)?,
-                        last_sync_at_utc: sync_at_utc.map(str::to_string).or(row.get(5)?),
-                    })
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
                 },
-            )
-            .map_err(Into::into)
+            )?;
+        Ok(DeviceSyncState {
+            workspace_id: workspace_id.to_string(),
+            device_id: device_id.to_string(),
+            friendly_name,
+            os,
+            arch,
+            metadata_updated_at_utc,
+            metadata_version,
+            last_sync_at_utc: sync_at_utc.map(str::to_string).or(stored_sync),
+            sources: self.device_sources(device_id)?,
+        })
     }
 
     pub fn apply_device_sync_state(&self, device: &DeviceSyncState) -> Result<()> {
@@ -249,7 +258,49 @@ impl Store {
                 device.metadata_version,
             ],
         )?;
+        self.conn.execute(
+            "DELETE FROM device_sources WHERE device_id = ?1",
+            rusqlite::params![device.device_id],
+        )?;
+        for source in &device.sources {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO device_sources (device_id, source) VALUES (?1, ?2)",
+                rusqlite::params![device.device_id, source],
+            )?;
+        }
         Ok(())
+    }
+
+    pub fn set_device_source(&self, device_id: &str, source: &str, tracked: bool) -> Result<()> {
+        self.ensure_device(&NewDevice {
+            device_id: device_id.to_string(),
+            friendly_name: device_id.to_string(),
+            os: String::new(),
+            arch: String::new(),
+            last_sync_at_utc: None,
+        })?;
+        if tracked {
+            self.conn.execute(
+                "INSERT OR IGNORE INTO device_sources (device_id, source) VALUES (?1, ?2)",
+                rusqlite::params![device_id, source],
+            )?;
+        } else {
+            self.conn.execute(
+                "DELETE FROM device_sources WHERE device_id = ?1 AND source = ?2",
+                rusqlite::params![device_id, source],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn device_sources(&self, device_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT source FROM device_sources WHERE device_id = ?1 ORDER BY source")?;
+        let sources = stmt
+            .query_map(rusqlite::params![device_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(sources)
     }
 
     pub fn device_ids_matching(&self, reference: &str) -> Result<Vec<String>> {
@@ -326,6 +377,7 @@ impl Store {
                 e.adapter_version
             ],
         )?;
+        self.set_device_source(&e.device_id, &e.source, true)?;
         Ok(changed == 1)
     }
 
@@ -345,6 +397,7 @@ impl Store {
                 s.observing_device_id
             ],
         )?;
+        self.set_device_source(&s.observing_device_id, &s.source, true)?;
         Ok(())
     }
 
@@ -353,15 +406,34 @@ impl Store {
     /// import therefore does not grow snapshot history with no-op rows.
     /// Returns true when a new observation was stored.
     pub fn record_snapshot_if_changed(&self, s: &NewSnapshot) -> Result<bool> {
+        self.set_device_source(&s.observing_device_id, &s.source, true)?;
         let latest = self.conn.query_row(
-            "SELECT used_percent, resets_at_utc FROM quota_snapshots
+            "SELECT id, used_percent, resets_at_utc, observed_at_utc FROM quota_snapshots
              WHERE source = ?1 AND window = ?2
              ORDER BY observed_at_utc DESC, id DESC LIMIT 1",
             rusqlite::params![s.source, s.window],
-            |row| Ok((row.get::<_, f64>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
         );
         let changed = match latest {
-            Ok((percent, resets)) => !(percent == s.used_percent && resets == s.resets_at_utc),
+            Ok((id, percent, resets, observed_at)) => {
+                let value_changed = !(percent == s.used_percent && resets == s.resets_at_utc);
+                if !value_changed && s.observed_at_utc > observed_at {
+                    self.conn.execute(
+                        "UPDATE quota_snapshots
+                         SET observed_at_utc = ?2, observing_device_id = ?3
+                         WHERE id = ?1",
+                        rusqlite::params![id, s.observed_at_utc, s.observing_device_id],
+                    )?;
+                }
+                value_changed
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => true,
             Err(e) => return Err(e.into()),
         };

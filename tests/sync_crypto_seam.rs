@@ -248,6 +248,8 @@ fn two_devices_converge_on_encrypted_names_and_successful_sync_times() {
             last_sync_at_utc: None,
         })
         .unwrap();
+    first.set_device_source("device-a", "claude", true).unwrap();
+    second.set_device_source("device-b", "codex", true).unwrap();
     let mut relay = FakeRelay::default();
 
     sync_once(&first, &mut relay, &config("device-a")).unwrap();
@@ -270,6 +272,24 @@ fn two_devices_converge_on_encrypted_names_and_successful_sync_times() {
             .machines
             .iter()
             .all(|machine| machine.last_sync_at_utc.is_some()));
+        assert_eq!(
+            fleet
+                .machines
+                .iter()
+                .find(|machine| machine.name == "laptop")
+                .unwrap()
+                .sources,
+            vec!["claude"]
+        );
+        assert_eq!(
+            fleet
+                .machines
+                .iter()
+                .find(|machine| machine.name == "builder")
+                .unwrap()
+                .sources,
+            vec!["codex"]
+        );
     }
     assert!(relay.stored.iter().all(|record| {
         !record
@@ -404,7 +424,7 @@ fn offline_outbox_retries_without_losing_the_record() {
 
     let error = sync_once(&store, &mut relay, &config("device-a")).unwrap_err();
     assert!(matches!(error, SyncError::Relay(RelayError::Unavailable)));
-    assert_eq!(store.pending_sync_count().unwrap(), 2);
+    assert_eq!(store.pending_sync_count().unwrap(), 1);
 
     relay.unavailable = false;
     let summary = sync_once(&store, &mut relay, &config("device-a")).unwrap();
@@ -414,6 +434,24 @@ fn offline_outbox_retries_without_losing_the_record() {
         decrypt_record(&config("device-a").key, record).unwrap()
             == SyncRecord::UsageEvent(Box::new(event("offline-event", "device-a")))
     }));
+}
+
+#[test]
+fn failed_download_does_not_record_or_publish_a_successful_sync() {
+    let store = Store::open_in_memory().unwrap();
+    device(&store, "device-a");
+    let mut relay = FakeRelay {
+        download_failures: 1,
+        ..FakeRelay::default()
+    };
+
+    assert!(matches!(
+        sync_once(&store, &mut relay, &config("device-a")),
+        Err(SyncError::Relay(RelayError::Unavailable))
+    ));
+    let fleet = aiu::report::fleet::build(&store, aiu::utc::now_epoch()).unwrap();
+    assert!(fleet.machines[0].last_sync_at_utc.is_none());
+    assert!(relay.stored.is_empty());
 }
 
 #[test]
@@ -452,7 +490,7 @@ fn collected_usage_is_queued_before_an_offline_sync_attempt() {
         sync_once(&store, &mut relay, &config("device-a")),
         Err(SyncError::Relay(RelayError::Unavailable))
     ));
-    assert_eq!(store.pending_sync_count().unwrap(), 2);
+    assert_eq!(store.pending_sync_count().unwrap(), 1);
 
     std::fs::remove_dir_all(directory).ok();
 }
@@ -570,7 +608,7 @@ fn revoked_device_is_rejected_without_draining_its_outbox() {
         sync_once(&store, &mut relay, &config("device-a")),
         Err(SyncError::Relay(RelayError::Revoked))
     ));
-    assert_eq!(store.pending_sync_count().unwrap(), 2);
+    assert_eq!(store.pending_sync_count().unwrap(), 1);
     assert!(relay.stored.is_empty());
 }
 
@@ -588,5 +626,5 @@ fn record_from_another_workspace_never_leaves_the_device() {
         Err(SyncError::WorkspaceMismatch)
     ));
     assert!(relay.stored.is_empty());
-    assert_eq!(store.pending_sync_count().unwrap(), 2);
+    assert_eq!(store.pending_sync_count().unwrap(), 1);
 }
