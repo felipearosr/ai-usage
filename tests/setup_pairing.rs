@@ -4,9 +4,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use aiu::setup::{
-    complete_host_pairing, finish_join, init_workspace, load_sync_config, render_init, render_join,
-    start_join, EncryptedGrant, JoinRequest, PairingOffer, PairingRelay, PairingRelayError,
-    SetupError, PAIRING_LIFETIME_SECS,
+    complete_host_pairing, finish_join, init_workspace, init_workspace_with_progress,
+    load_sync_config, render_init, render_join, start_join, EncryptedGrant, JoinRequest,
+    PairingOffer, PairingRelay, PairingRelayError, SetupError, PAIRING_LIFETIME_SECS,
 };
 use aiu::store::Store;
 use aiu::sync::{
@@ -403,5 +403,23 @@ fn failed_offer_publication_does_not_poison_local_setup() {
         1,
         "a retry must reuse the pending device credential"
     );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn setup_reports_import_progress_per_detected_source() {
+    let home = temp_home("progress");
+    claude_fixture(&home);
+    codex_fixture(&home);
+    let store = Store::open_in_memory().unwrap();
+    let mut relay = FakeRelay::default();
+    let mut updates = Vec::new();
+
+    init_workspace_with_progress(&store, &mut relay, "desktop", &home, 10, &mut |item| {
+        updates.push((item.source, item.events_imported))
+    })
+    .unwrap();
+
+    assert_eq!(updates, vec![("claude", 1), ("codex", 1)]);
     std::fs::remove_dir_all(home).ok();
 }

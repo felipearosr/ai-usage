@@ -117,14 +117,15 @@ struct RegisterWorkspace<'a> {
 }
 
 #[derive(Serialize)]
-struct RequestJoin {
-    request: JoinRequest,
-    now_epoch: u64,
+struct PublishOffer<'a> {
+    locator: &'a str,
+    workspace_id: &'a str,
+    host_public_key: &'a [u8; 32],
 }
 
 #[derive(Serialize)]
-struct PendingJoin {
-    now_epoch: u64,
+struct RequestJoin {
+    request: JoinRequest,
 }
 
 #[derive(Deserialize)]
@@ -138,13 +139,11 @@ struct CompleteJoin<'a> {
     workspace_id: &'a str,
     joined_device_credential: &'a str,
     grant: EncryptedGrant,
-    now_epoch: u64,
 }
 
 #[derive(Serialize)]
 struct TakeGrant<'a> {
     request_id: &'a str,
-    now_epoch: u64,
 }
 
 #[derive(Serialize)]
@@ -180,19 +179,27 @@ impl PairingRelay for HttpRelayClient {
         device_credential: &str,
         offer: PairingOffer,
     ) -> Result<(), PairingRelayError> {
-        self.post_empty("/v1/pairing/offers", Some(device_credential), &offer)
+        self.post_empty(
+            "/v1/pairing/offers",
+            Some(device_credential),
+            &PublishOffer {
+                locator: &offer.locator,
+                workspace_id: &offer.workspace_id,
+                host_public_key: &offer.host_public_key,
+            },
+        )
     }
 
     fn request_join(
         &mut self,
         locator: &str,
         request: JoinRequest,
-        now_epoch: u64,
+        _now_epoch: u64,
     ) -> Result<PairingOffer, PairingRelayError> {
         self.post(
             &format!("/v1/pairing/{locator}/requests"),
             None,
-            &RequestJoin { request, now_epoch },
+            &RequestJoin { request },
         )
     }
 
@@ -200,12 +207,12 @@ impl PairingRelay for HttpRelayClient {
         &mut self,
         device_credential: &str,
         locator: &str,
-        now_epoch: u64,
+        _now_epoch: u64,
     ) -> Result<Option<JoinRequest>, PairingRelayError> {
         let response: PendingJoinResponse = self.post(
             &format!("/v1/pairing/{locator}/pending"),
             Some(device_credential),
-            &PendingJoin { now_epoch },
+            &(),
         )?;
         Ok(response.request)
     }
@@ -218,7 +225,7 @@ impl PairingRelay for HttpRelayClient {
         workspace_id: &str,
         joined_device_credential: &str,
         grant: EncryptedGrant,
-        now_epoch: u64,
+        _now_epoch: u64,
     ) -> Result<(), PairingRelayError> {
         self.post_empty(
             &format!("/v1/pairing/{locator}/grant"),
@@ -228,7 +235,6 @@ impl PairingRelay for HttpRelayClient {
                 workspace_id,
                 joined_device_credential,
                 grant,
-                now_epoch,
             },
         )
     }
@@ -237,15 +243,12 @@ impl PairingRelay for HttpRelayClient {
         &mut self,
         locator: &str,
         request_id: &str,
-        now_epoch: u64,
+        _now_epoch: u64,
     ) -> Result<EncryptedGrant, PairingRelayError> {
         self.post(
             &format!("/v1/pairing/{locator}/take"),
             None,
-            &TakeGrant {
-                request_id,
-                now_epoch,
-            },
+            &TakeGrant { request_id },
         )
     }
 }

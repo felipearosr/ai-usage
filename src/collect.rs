@@ -115,6 +115,15 @@ pub fn collect_detected(
     home: &Path,
     ctx: &IngestContext,
 ) -> Result<Vec<SourceCollect>> {
+    collect_detected_with_progress(store, home, ctx, &mut |_| {})
+}
+
+pub fn collect_detected_with_progress(
+    store: &Store,
+    home: &Path,
+    ctx: &IngestContext,
+    progress: &mut dyn FnMut(&SourceCollect),
+) -> Result<Vec<SourceCollect>> {
     let mut results = Vec::new();
     for detection in crate::sources::detect(home) {
         let mode = store.source_mode(detection.source)?;
@@ -128,13 +137,9 @@ pub fn collect_detected(
         if files.is_empty() {
             continue;
         }
-        results.push(collect_source(
-            store,
-            adapter,
-            &files,
-            ctx,
-            ImportOptions::default(),
-        )?);
+        let result = collect_source(store, adapter, &files, ctx, ImportOptions::default())?;
+        progress(&result);
+        results.push(result);
     }
     Ok(results)
 }

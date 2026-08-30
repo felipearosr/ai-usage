@@ -280,6 +280,17 @@ pub fn init_workspace(
     home: &Path,
     now_epoch: u64,
 ) -> Result<InitOutcome> {
+    init_workspace_with_progress(store, relay, friendly_name, home, now_epoch, &mut |_| {})
+}
+
+pub fn init_workspace_with_progress(
+    store: &Store,
+    relay: &mut dyn PairingRelay,
+    friendly_name: &str,
+    home: &Path,
+    now_epoch: u64,
+    progress: &mut dyn FnMut(&SourceCollect),
+) -> Result<InitOutcome> {
     validate_fresh(store)?;
     validate_friendly_name(friendly_name)?;
     // Plain report commands may have already minted storage-level ids while
@@ -319,7 +330,7 @@ pub fn init_workspace(
         &workspace_key,
     )?;
     let (detected_sources, imports) =
-        import_history(store, home, &workspace_id, &device_id, now_epoch)?;
+        import_history(store, home, &workspace_id, &device_id, now_epoch, progress)?;
     let pairing_code = pairing.code().to_string();
 
     Ok(InitOutcome {
@@ -461,6 +472,17 @@ pub fn finish_join(
     home: &Path,
     now_epoch: u64,
 ) -> Result<JoinOutcome> {
+    finish_join_with_progress(store, relay, attempt, home, now_epoch, &mut |_| {})
+}
+
+pub fn finish_join_with_progress(
+    store: &Store,
+    relay: &mut dyn PairingRelay,
+    attempt: &JoinAttempt,
+    home: &Path,
+    now_epoch: u64,
+    progress: &mut dyn FnMut(&SourceCollect),
+) -> Result<JoinOutcome> {
     validate_fresh(store)?;
     if attempt.expires_at_epoch < now_epoch {
         return Err(SetupError::Expired);
@@ -477,8 +499,14 @@ pub fn finish_join(
     )?;
     let workspace_id = payload.workspace_id.clone();
     payload.workspace_key.zeroize();
-    let (detected_sources, imports) =
-        import_history(store, home, &workspace_id, &attempt.device_id, now_epoch)?;
+    let (detected_sources, imports) = import_history(
+        store,
+        home,
+        &workspace_id,
+        &attempt.device_id,
+        now_epoch,
+        progress,
+    )?;
     Ok(JoinOutcome {
         workspace_id,
         device_id: attempt.device_id.clone(),
@@ -509,7 +537,7 @@ pub fn render_init(outcome: &InitOutcome) -> String {
         .map(|item| item.events_imported)
         .sum();
     format!(
-        "Workspace created\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\nScheduler: installation runs during `aiu collect` setup\nPair another machine within 10 minutes:\n  aiu join {}\n",
+        "Workspace created\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\nScheduler: automatic collection is not installed yet\nPair another machine within 10 minutes:\n  aiu join {}\n",
         outcome.device_id, outcome.pairing_code
     )
 }
@@ -603,6 +631,7 @@ fn import_history(
     workspace_id: &str,
     device_id: &str,
     now_epoch: u64,
+    progress: &mut dyn FnMut(&SourceCollect),
 ) -> Result<(Vec<&'static str>, Vec<SourceCollect>)> {
     let detections = crate::sources::detect(home);
     let detected_sources = detections
@@ -615,7 +644,7 @@ fn import_history(
         workspace_id: workspace_id.to_string(),
         now_epoch,
     };
-    let imports = crate::collect::collect_detected(store, home, &context)?;
+    let imports = crate::collect::collect_detected_with_progress(store, home, &context, progress)?;
     Ok((detected_sources, imports))
 }
 

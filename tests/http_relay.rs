@@ -74,6 +74,10 @@ fn pairing_client_sends_the_minimal_join_request() {
     let body = request.split_once("\r\n\r\n").unwrap().1;
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["request"]["device_id"], "device-2");
+    assert!(
+        json.get("now_epoch").is_none(),
+        "the relay owns expiry time"
+    );
     assert!(!request.contains("workspace_key"));
 }
 
@@ -108,4 +112,27 @@ fn sync_upload_sends_only_opaque_records_with_device_auth() {
     assert!(request.contains("\"opaque-workspace\""));
     assert!(!request.contains("model"));
     assert!(!request.contains("machine"));
+}
+
+#[test]
+fn offer_expiry_is_assigned_by_the_relay_not_the_client() {
+    let (base_url, server) = serve_once("{}");
+    let mut relay = HttpRelayClient::new(&base_url).unwrap();
+    relay
+        .publish_offer(
+            "device-secret",
+            PairingOffer {
+                locator: "0011223344556677".into(),
+                workspace_id: "opaque-workspace".into(),
+                host_public_key: [7; 32],
+                expires_at_epoch: u64::MAX,
+            },
+        )
+        .unwrap();
+
+    let request = server.join().unwrap();
+    let body = request.split_once("\r\n\r\n").unwrap().1;
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert!(json.get("expires_at_epoch").is_none());
+    assert!(json.get("now_epoch").is_none());
 }
