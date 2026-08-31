@@ -8,6 +8,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod go;
 
 use std::io::BufRead;
 

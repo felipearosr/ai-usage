@@ -130,12 +130,12 @@ fn collect_source_with_progress(
 }
 
 /// Maps a source identifier to its adapter, so collection can drive whatever
-/// discovery found. Sources without an adapter yet (e.g. `go`, issue 04) are
-/// simply skipped.
+/// discovery found. Sources without an adapter are skipped.
 pub fn adapter_for(source: &str) -> Option<&'static dyn SourceAdapter> {
     match source {
         "claude" => Some(&crate::adapters::claude::ClaudeCodeAdapter),
         "codex" => Some(&crate::adapters::codex::CodexAdapter),
+        "go" => Some(&crate::adapters::go::OpenCodeGoAdapter),
         _ => None,
     }
 }
