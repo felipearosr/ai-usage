@@ -124,17 +124,22 @@ pub fn prune(store: &Store, now_epoch: u64) -> Result<PruneSummary> {
 ///   would both break that and violate the foreign key.
 ///
 /// The local device is never retired whatever its state — this machine always
-/// needs its own row.
+/// needs its own row. If its id cannot be read at all, no device is pruned:
+/// the exemption failing open would retire the very row it exists to
+/// protect, and skipping a pass costs nothing but a day.
 fn prune_devices(
     tx: &rusqlite::Transaction<'_>,
     cutoff: &str,
     local_device_id: Option<&str>,
 ) -> Result<u64> {
+    let Some(local_device_id) = local_device_id else {
+        return Ok(0);
+    };
     // `device_sources` references `devices`, so it is cleared first.
     let condition = "
         revoked_at_utc IS NOT NULL
         AND revoked_at_utc < ?1
-        AND (?2 IS NULL OR device_id <> ?2)
+        AND device_id <> ?2
         AND device_id NOT IN (SELECT device_id FROM usage_events)
         AND device_id NOT IN (SELECT observing_device_id FROM quota_snapshots)";
 

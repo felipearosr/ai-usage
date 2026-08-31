@@ -88,8 +88,11 @@ pub fn run(
     // there is no daemon to run it on its own schedule.
     let pruned = retention::prune(store, now_epoch)?;
 
-    // Stamped after the work, so it records a pass that actually completed —
-    // this is what `aiu status` reports as the last collection.
+    // Written only once every stage has succeeded, so it marks a pass that
+    // actually completed — this is what `aiu status` reports as the last
+    // collection. The value is the caller's `now_epoch`, the same logical
+    // instant the retention cutoff uses, so a pass is stamped consistently
+    // with what it pruned rather than with however long it happened to run.
     store.set_metadata(
         crate::report::status::LAST_COLLECT_KEY,
         &crate::utc::format_epoch(now_epoch),

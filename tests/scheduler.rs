@@ -490,9 +490,9 @@ mod lifecycle {
                 .unwrap_or_else(|| panic!("{platform:?} schedule reads back"));
 
             assert_eq!(read.platform, platform);
-            assert_eq!(read.exe, spec.exe, "{platform:?}");
-            assert_eq!(read.interval_minutes, 20, "{platform:?}");
-            assert_eq!(read.environment, spec.environment, "{platform:?}");
+            assert_eq!(read.spec.exe, spec.exe, "{platform:?}");
+            assert_eq!(read.spec.interval_minutes, 20, "{platform:?}");
+            assert_eq!(read.spec.environment, spec.environment, "{platform:?}");
 
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -513,8 +513,8 @@ mod lifecycle {
 
             let read = scheduler::read_installed(platform, &root, None).unwrap();
 
-            assert_eq!(read.exe, spec.exe, "{platform:?}");
-            assert_eq!(read.environment, spec.environment, "{platform:?}");
+            assert_eq!(read.spec.exe, spec.exe, "{platform:?}");
+            assert_eq!(read.spec.environment, spec.environment, "{platform:?}");
 
             let _ = std::fs::remove_dir_all(&root);
         }
@@ -547,9 +547,9 @@ mod lifecycle {
     fn an_unchanged_environment_reports_no_drift() {
         let installed = InstalledSchedule {
             platform: Platform::Linux,
-            exe: PathBuf::from("/usr/local/bin/aiu"),
-            interval_minutes: 20,
-            environment: spec_with_env().environment,
+            spec: ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+                .every_minutes(20)
+                .with_environment(spec_with_env().environment),
             unit_paths: Vec::new(),
         };
         assert!(scheduler::drift(&installed, &spec_with_env()).is_empty());
@@ -561,15 +561,13 @@ mod lifecycle {
     fn drift_names_each_value_that_changed() {
         let installed = InstalledSchedule {
             platform: Platform::Linux,
-            exe: PathBuf::from("/old/bin/aiu"),
-            interval_minutes: 15,
-            environment: vec![
+            spec: ScheduleSpec::new(PathBuf::from("/old/bin/aiu")).with_environment(vec![
                 (
                     "AIU_RELAY_URL".to_string(),
                     "https://old.example".to_string(),
                 ),
                 ("AIU_DATA_DIR".to_string(), "/srv/aiu".to_string()),
-            ],
+            ]),
             unit_paths: Vec::new(),
         };
         let current = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
@@ -622,9 +620,8 @@ mod lifecycle {
     fn a_changed_data_directory_is_reported_as_drift() {
         let installed = InstalledSchedule {
             platform: Platform::Linux,
-            exe: PathBuf::from("/usr/local/bin/aiu"),
-            interval_minutes: 15,
-            environment: vec![("AIU_DATA_DIR".to_string(), "/old/db".to_string())],
+            spec: ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+                .with_environment(vec![("AIU_DATA_DIR".to_string(), "/old/db".to_string())]),
             unit_paths: Vec::new(),
         };
         let current = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))

@@ -22,6 +22,9 @@ fn store_with_device() -> Store {
             last_sync_at_utc: None,
         })
         .unwrap();
+    // A real machine always knows its own device id; device pruning refuses
+    // to run without it.
+    store.set_metadata("device_id", "dev-a").unwrap();
     store
 }
 
@@ -317,7 +320,6 @@ mod devices {
     #[test]
     fn the_local_device_is_never_pruned() {
         let store = store_with_device();
-        store.set_metadata("device_id", "dev-a").unwrap();
         store.mark_device_revoked("dev-a", &at(400 * DAY)).unwrap();
 
         let summary = retention::prune(&store, NOW).unwrap();
@@ -344,6 +346,33 @@ mod devices {
             "an in-window observation is history too"
         );
         assert!(device_exists(&store, "dev-snap"));
+    }
+
+    /// The exemption protects the local device by name, so without that name
+    /// it cannot protect anything. Refusing to prune is the safe direction:
+    /// skipping a pass costs a day, retiring this machine's own row does not
+    /// undo.
+    #[test]
+    fn no_device_is_pruned_when_the_local_machine_cannot_be_identified() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .ensure_device(&aiu::store::NewDevice {
+                device_id: "dev-orphan".into(),
+                friendly_name: "orphan".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                last_sync_at_utc: None,
+            })
+            .unwrap();
+        store
+            .mark_device_revoked("dev-orphan", &at(400 * DAY))
+            .unwrap();
+        assert!(store.get_metadata("device_id").unwrap().is_none());
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(summary.devices, 0);
+        assert!(device_exists(&store, "dev-orphan"));
     }
 
     #[test]

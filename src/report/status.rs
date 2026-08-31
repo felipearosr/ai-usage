@@ -34,14 +34,22 @@ pub enum ScheduleStatus {
     /// This OS has no scheduler aiu knows how to install.
     Unsupported,
     NotInstalled,
+    /// Unit files exist but could not be read back. Distinct from
+    /// `NotInstalled`: something *is* scheduled, and what it will do is
+    /// exactly what cannot be determined — reporting it as absent would hide
+    /// the case drift detection exists for.
+    Unreadable {
+        unit_paths: Vec<std::path::PathBuf>,
+    },
     Installed {
         platform: Platform,
         interval_minutes: u64,
         activated: bool,
         unit_paths: Vec<std::path::PathBuf>,
-        /// Ways the installed unit disagrees with this environment. Empty
-        /// means a scheduled run behaves like an interactive one.
-        drift: Vec<Drift>,
+        /// Ways the installed unit disagrees with this environment. `None`
+        /// when the comparison could not be made at all, which must not be
+        /// reported as "up to date".
+        drift: Option<Vec<Drift>>,
     },
 }
 
@@ -58,6 +66,13 @@ pub enum RelayStatus {
     /// The machine has not paired, so there is no relay to reach.
     NotConfigured,
     Reachable,
+    /// The relay answered and refused this device. Distinct from an
+    /// unreachable relay: the network is fine and the fix is different, and
+    /// a revoked machine is among the likeliest to be running `aiu status`.
+    Revoked,
+    /// The relay could not be addressed at all — a malformed URL, or local
+    /// configuration that could not be loaded. Not a network problem.
+    Misconfigured(String),
     Unreachable(String),
 }
 
@@ -116,7 +131,10 @@ pub fn render_text(report: &StatusReport) -> String {
         },
     );
     row("Scheduler", schedule_line(&report.schedule));
-    if let ScheduleStatus::Installed { drift, .. } = &report.schedule {
+    if let ScheduleStatus::Installed {
+        drift: Some(drift), ..
+    } = &report.schedule
+    {
         for item in drift {
             row("", format!("! {}", scheduler::describe_drift(item)));
         }
@@ -141,12 +159,36 @@ pub fn render_text(report: &StatusReport) -> String {
     out
 }
 
+/// The schedule as prose, including any drift, for callers that render it
+/// outside the status table — `aiu schedule` shows the same facts, and a
+/// second copy of this wording would drift from this one.
+pub fn render_schedule(schedule: &ScheduleStatus) -> String {
+    let mut out = schedule_line(schedule);
+    out.push('\n');
+    if let ScheduleStatus::Installed {
+        drift: Some(drift), ..
+    } = schedule
+    {
+        for item in drift {
+            out.push_str(&format!("  ! {}\n", scheduler::describe_drift(item)));
+        }
+    }
+    out
+}
+
 fn schedule_line(schedule: &ScheduleStatus) -> String {
     match schedule {
         ScheduleStatus::Unsupported => {
             "no supported scheduler on this OS; run `aiu collect` manually".to_string()
         }
         ScheduleStatus::NotInstalled => "not installed; run `aiu schedule install`".to_string(),
+        ScheduleStatus::Unreadable { unit_paths } => format!(
+            "installed but unreadable ({}); run `aiu schedule install` to rewrite it",
+            unit_paths
+                .first()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unknown location".to_string())
+        ),
         ScheduleStatus::Installed {
             platform,
             interval_minutes,
@@ -158,8 +200,12 @@ fn schedule_line(schedule: &ScheduleStatus) -> String {
             if !activated {
                 line.push_str(" (written but not activated)");
             }
-            if !drift.is_empty() {
-                line.push_str(" — stale, run `aiu schedule install` to repair");
+            match drift {
+                Some(drift) if !drift.is_empty() => {
+                    line.push_str(" — stale, run `aiu schedule install` to repair")
+                }
+                Some(_) => {}
+                None => line.push_str(" — cannot be compared against this environment"),
             }
             line
         }
@@ -188,7 +234,15 @@ fn relay_line(relay: &RelayStatus) -> String {
     match relay {
         RelayStatus::NotConfigured => "not paired; nothing to reach".to_string(),
         RelayStatus::Reachable => "reachable".to_string(),
-        RelayStatus::Unreachable(why) => format!("unreachable ({why})"),
+        RelayStatus::Revoked => {
+            "this machine's access was revoked; re-pair with `aiu join`".to_string()
+        }
+        RelayStatus::Misconfigured(why) => {
+            format!("misconfigured ({})", crate::redact::url_userinfo(why))
+        }
+        RelayStatus::Unreachable(why) => {
+            format!("unreachable ({})", crate::redact::url_userinfo(why))
+        }
     }
 }
 
@@ -196,6 +250,13 @@ pub fn render_json(report: &StatusReport) -> String {
     let schedule = match &report.schedule {
         ScheduleStatus::Unsupported => json!({ "state": "unsupported" }),
         ScheduleStatus::NotInstalled => json!({ "state": "not_installed" }),
+        ScheduleStatus::Unreadable { unit_paths } => json!({
+            "state": "unreadable",
+            "unit_paths": unit_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        }),
         ScheduleStatus::Installed {
             platform,
             interval_minutes,
@@ -211,16 +272,24 @@ pub fn render_json(report: &StatusReport) -> String {
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>(),
-            "drift": drift
+            "drift": drift.as_ref().map(|drift| drift
                 .iter()
                 .map(scheduler::describe_drift)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()),
         }),
     };
     let relay = match &report.relay {
         RelayStatus::NotConfigured => json!({ "state": "not_configured" }),
         RelayStatus::Reachable => json!({ "state": "reachable" }),
-        RelayStatus::Unreachable(why) => json!({ "state": "unreachable", "detail": why }),
+        RelayStatus::Revoked => json!({ "state": "revoked" }),
+        RelayStatus::Misconfigured(why) => json!({
+            "state": "misconfigured",
+            "detail": crate::redact::url_userinfo(why),
+        }),
+        RelayStatus::Unreachable(why) => json!({
+            "state": "unreachable",
+            "detail": crate::redact::url_userinfo(why),
+        }),
     };
 
     let value = json!({

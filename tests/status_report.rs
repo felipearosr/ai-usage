@@ -39,7 +39,7 @@ fn installed_schedule() -> ScheduleStatus {
         unit_paths: vec![PathBuf::from(
             "/home/me/.config/systemd/user/aiu-collect.timer",
         )],
-        drift: Vec::new(),
+        drift: Some(Vec::new()),
     }
 }
 
@@ -165,11 +165,11 @@ fn scheduler_drift_is_reported_with_the_value_that_changed() {
         interval_minutes: 15,
         activated: true,
         unit_paths: Vec::new(),
-        drift: vec![Drift::Environment {
+        drift: Some(vec![Drift::Environment {
             key: "AIU_DATA_DIR".into(),
             installed: Some("/old/db".into()),
             current: Some("/new/db".into()),
-        }],
+        }]),
     };
 
     let text = status::render_text(&build(&store, schedule, RelayStatus::Reachable));
@@ -329,11 +329,132 @@ fn the_collect_pipeline_records_the_time_status_reads() {
 fn drift_is_computed_against_the_current_spec() {
     let installed = InstalledSchedule {
         platform: Platform::Linux,
-        exe: PathBuf::from("/old/aiu"),
-        interval_minutes: 15,
-        environment: Vec::new(),
+        spec: ScheduleSpec::new(PathBuf::from("/old/aiu")),
         unit_paths: Vec::new(),
     };
     let current = ScheduleSpec::new(PathBuf::from("/new/aiu"));
     assert!(!aiu::scheduler::drift(&installed, &current).is_empty());
+}
+
+/// A hand-edited or corrupt unit is still a schedule: reporting it as absent
+/// would hide exactly the case drift detection exists for.
+#[test]
+fn units_that_cannot_be_read_are_distinguished_from_no_units_at_all() {
+    let store = store_with_device();
+    let text = status::render_text(&build(
+        &store,
+        ScheduleStatus::Unreadable {
+            unit_paths: vec![PathBuf::from(
+                "/home/me/.config/systemd/user/aiu-collect.timer",
+            )],
+        },
+        RelayStatus::Reachable,
+    ));
+
+    assert!(text.contains("unreadable"), "{text}");
+    assert!(
+        !text.contains("not installed"),
+        "not the same thing: {text}"
+    );
+}
+
+/// With nothing to compare against, "no drift found" would be a claim the
+/// report cannot support.
+#[test]
+fn an_uncomparable_schedule_is_not_reported_as_up_to_date() {
+    let store = store_with_device();
+    let schedule = ScheduleStatus::Installed {
+        platform: Platform::Linux,
+        interval_minutes: 15,
+        activated: true,
+        unit_paths: Vec::new(),
+        drift: None,
+    };
+
+    let text = status::render_text(&build(&store, schedule, RelayStatus::Reachable));
+    assert!(text.contains("cannot be compared"), "{text}");
+}
+
+/// A revoked machine is among the likeliest to run `aiu status`, and telling
+/// it the network is down would send it after the wrong problem.
+#[test]
+fn a_revoked_device_is_told_it_was_revoked_not_that_the_relay_is_down() {
+    let store = store_with_device();
+    let text = status::render_text(&build(&store, installed_schedule(), RelayStatus::Revoked));
+
+    assert!(text.contains("revoked"), "{text}");
+    assert!(!text.contains("unreachable"), "{text}");
+    assert!(text.contains("aiu join"), "it names the fix: {text}");
+}
+
+#[test]
+fn a_relay_that_cannot_be_addressed_is_not_reported_as_unreachable() {
+    let store = store_with_device();
+    let text = status::render_text(&build(
+        &store,
+        installed_schedule(),
+        RelayStatus::Misconfigured("invalid relay url".into()),
+    ));
+
+    assert!(text.contains("misconfigured"), "{text}");
+    assert!(text.contains("invalid relay url"), "{text}");
+}
+
+/// `aiu schedule` and `aiu status` must not describe the same state
+/// differently; both render through the same function.
+#[test]
+fn the_schedule_renderer_is_shared_with_the_status_table() {
+    let drifted = ScheduleStatus::Installed {
+        platform: Platform::Linux,
+        interval_minutes: 15,
+        activated: true,
+        unit_paths: Vec::new(),
+        drift: Some(vec![Drift::Interval {
+            installed: 15,
+            current: 30,
+        }]),
+    };
+
+    let standalone = status::render_schedule(&drifted);
+    assert!(standalone.contains("stale"), "{standalone}");
+    assert!(
+        standalone.contains("scheduled every 15 minutes"),
+        "{standalone}"
+    );
+}
+
+/// Redaction has to reach the rendering, not just exist as a helper: a relay
+/// URL with credentials is echoed back through drift lines and relay errors,
+/// and `aiu status --json` is what people paste into bug reports.
+#[test]
+fn credentials_in_a_relay_url_never_reach_either_rendering() {
+    let store = store_with_device();
+    let secret = "s3cret-token";
+    let schedule = ScheduleStatus::Installed {
+        platform: Platform::Linux,
+        interval_minutes: 15,
+        activated: true,
+        unit_paths: Vec::new(),
+        drift: Some(vec![Drift::Environment {
+            key: "AIU_RELAY_URL".into(),
+            installed: Some(format!("https://user:{secret}@old.example")),
+            current: Some(format!("https://user:{secret}@new.example")),
+        }]),
+    };
+    let report = build(
+        &store,
+        schedule,
+        RelayStatus::Unreachable(format!("https://user:{secret}@relay.example refused")),
+    );
+
+    for rendering in [status::render_text(&report), status::render_json(&report)] {
+        assert!(
+            !rendering.contains(secret),
+            "credential leaked into output:\n{rendering}"
+        );
+        assert!(
+            rendering.contains("old.example"),
+            "the useful part is still shown:\n{rendering}"
+        );
+    }
 }

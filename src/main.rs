@@ -202,15 +202,27 @@ fn probe_schedule(home: &std::path::Path) -> aiu::report::status::ScheduleStatus
         return ScheduleStatus::Unsupported;
     };
     let xdg = aiu::scheduler::config_home_from_env();
+    let unit_paths = aiu::scheduler::unit_paths(platform, home, xdg.as_deref());
+
     let Some(installed) = aiu::scheduler::read_installed(platform, home, xdg.as_deref()) else {
-        return ScheduleStatus::NotInstalled;
+        // Units present but unreadable is not the same as no units: something
+        // is still scheduled, and what it will do is what cannot be read.
+        return if aiu::scheduler::is_installed(platform, home, xdg.as_deref()) {
+            ScheduleStatus::Unreadable { unit_paths }
+        } else {
+            ScheduleStatus::NotInstalled
+        };
     };
-    let drift = aiu::scheduler::current_spec()
-        .map(|current| aiu::scheduler::drift(&installed, &current))
-        .unwrap_or_default();
+
+    // With no spec to compare against there is no basis for saying the
+    // schedule is current, so the absence is reported rather than read as
+    // agreement.
+    let drift =
+        aiu::scheduler::current_spec().map(|current| aiu::scheduler::drift(&installed, &current));
+
     ScheduleStatus::Installed {
         platform,
-        interval_minutes: installed.interval_minutes,
+        interval_minutes: installed.spec.interval_minutes,
         activated: aiu::scheduler::is_activated(platform, &mut aiu::scheduler::ProcessRunner),
         unit_paths: installed.unit_paths,
         drift,
@@ -226,60 +238,40 @@ fn probe_relay(store: &Store) -> aiu::report::status::RelayStatus {
         Err(error) => return RelayStatus::Unreachable(error.to_string()),
         Ok(true) => {}
     }
-    let probe = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let config = aiu::setup::load_sync_config(store, 1)?;
-        let mut relay = aiu::relay::HttpRelayClient::from_env()?;
-        aiu::sync::RelayClient::download(
-            &mut relay,
-            &config.device_credential,
-            &config.workspace_id,
-            None,
-            1,
-        )?;
-        Ok(())
-    })();
-    match probe {
-        Ok(()) => RelayStatus::Reachable,
+    // Addressing the relay and reaching it are different failures with
+    // different fixes, and a revoked device — the likeliest machine to be
+    // running this command — must not be told the network is down.
+    let config = match aiu::setup::load_sync_config(store, 1) {
+        Ok(config) => config,
+        Err(error) => return RelayStatus::Misconfigured(error.to_string()),
+    };
+    let mut relay = match aiu::relay::HttpRelayClient::from_env() {
+        Ok(relay) => relay,
+        Err(error) => return RelayStatus::Misconfigured(error.to_string()),
+    };
+
+    match aiu::sync::RelayClient::download(
+        &mut relay,
+        &config.device_credential,
+        &config.workspace_id,
+        None,
+        1,
+    ) {
+        Ok(_) => RelayStatus::Reachable,
+        Err(aiu::sync::RelayError::Revoked) => RelayStatus::Revoked,
         Err(error) => RelayStatus::Unreachable(error.to_string()),
     }
 }
 
 fn run_schedule_show() -> Result<(), Box<dyn std::error::Error>> {
     let home = setup_home()?;
-    match probe_schedule(&home) {
-        aiu::report::status::ScheduleStatus::Unsupported => {
-            println!("No supported scheduler on this OS; run `aiu collect` manually.");
-        }
-        aiu::report::status::ScheduleStatus::NotInstalled => {
-            println!("No collection schedule installed. Run `aiu schedule install`.");
-        }
-        aiu::report::status::ScheduleStatus::Installed {
-            platform,
-            interval_minutes,
-            activated,
-            unit_paths,
-            drift,
-        } => {
-            println!(
-                "{} runs `aiu collect` every {interval_minutes} minutes{}.",
-                platform.as_str(),
-                if activated {
-                    ""
-                } else {
-                    " (written but not activated)"
-                }
-            );
-            for path in &unit_paths {
-                println!("  {}", path.display());
-            }
-            if drift.is_empty() {
-                println!("Up to date with this environment.");
-            } else {
-                println!("Stale — run `aiu schedule install` to repair:");
-                for item in &drift {
-                    println!("  ! {}", aiu::scheduler::describe_drift(item));
-                }
-            }
+    let schedule = probe_schedule(&home);
+    print!("{}", aiu::report::status::render_schedule(&schedule));
+    if let aiu::report::status::ScheduleStatus::Installed { unit_paths, .. }
+    | aiu::report::status::ScheduleStatus::Unreadable { unit_paths } = &schedule
+    {
+        for path in unit_paths {
+            println!("  {}", path.display());
         }
     }
     Ok(())

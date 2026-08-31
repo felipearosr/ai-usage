@@ -16,6 +16,7 @@ pub mod import;
 pub mod migrations;
 pub mod paths;
 pub mod pipeline;
+pub mod redact;
 pub mod relay;
 pub mod report;
 pub mod retention;

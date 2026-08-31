@@ -77,8 +77,8 @@ fn a_unit_with_a_multibyte_path_round_trips_intact() {
         scheduler::install(platform, &root, None, &spec, &mut runner).unwrap();
         let read = scheduler::read_installed(platform, &root, None)
             .unwrap_or_else(|| panic!("{platform:?} reads back"));
-        assert_eq!(read.exe, spec.exe, "{platform:?}");
-        assert_eq!(read.environment, spec.environment, "{platform:?}");
+        assert_eq!(read.spec.exe, spec.exe, "{platform:?}");
+        assert_eq!(read.spec.environment, spec.environment, "{platform:?}");
     }
 
     let _ = std::fs::remove_dir_all(&root);
