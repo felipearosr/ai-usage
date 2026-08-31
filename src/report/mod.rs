@@ -211,8 +211,8 @@ pub(crate) fn latest_window_quotas(
 }
 
 /// Canonical window ordering key. Known rolling windows follow the spec's
-/// order (`5h` → `week` → `month`); unknown windows fall after them, ordered
-/// by name so a newly reported window never disrupts the known sequence.
+/// order (`5h` → `week` → `month`); anything else sorts after them, by name,
+/// so sorting never misbehaves on an unexpected window string.
 fn window_order(window: &str) -> (u8, &str) {
     match window {
         "5h" => (0, window),

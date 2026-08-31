@@ -175,3 +175,42 @@ fn go_usage_never_leaks_into_claude_or_codex_statistics() {
     assert!(text[go_block_start..].contains("gpt-5.6-luna"));
     assert!(!text[claude_block_start..go_block_start + 1].contains("gpt-5.6-luna"));
 }
+
+#[test]
+fn go_quota_reset_replaces_the_earlier_observation() {
+    let store = harness();
+    device(&store, "dev-laptop", "laptop");
+
+    // A month observation near exhaustion, then a later one after reset: the
+    // report shows the latest observation, never the stale near-zero or the
+    // pre-reset near-100.
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "go".into(),
+            window: "month".into(),
+            used_percent: 90.0,
+            resets_at_utc: None,
+            observed_at_utc: utc::format_epoch(NOW - 3600),
+            observing_device_id: "dev-laptop".into(),
+        })
+        .unwrap();
+    store
+        .record_snapshot(&NewSnapshot {
+            source: "go".into(),
+            window: "month".into(),
+            used_percent: 2.5,
+            resets_at_utc: Some(utc::format_epoch(NOW + 86_400)),
+            observed_at_utc: utc::format_epoch(NOW - 60),
+            observing_device_id: "dev-laptop".into(),
+        })
+        .unwrap();
+
+    let detail = detail::build(&store, "go", NOW).unwrap();
+    let month = detail.windows.iter().find(|w| w.window == "month").unwrap();
+    assert_eq!(month.vendor.as_ref().unwrap().used_percent, 2.5);
+    assert_eq!(
+        month.vendor.as_ref().unwrap().resets_in_secs(NOW),
+        Some(86_400),
+        "post-reset observation wins with its own reset time"
+    );
+}

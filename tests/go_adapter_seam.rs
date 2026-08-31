@@ -372,6 +372,62 @@ fn rerunning_import_never_double_counts() {
 }
 
 #[test]
+fn exact_models_stay_distinct_within_a_session() {
+    // A mixed-model session (two message files) is attributed per message,
+    // never flattened to one model (spec story 36).
+    let first = assistant_message(
+        "msg-a",
+        "ses-mixed",
+        "glm-5.3",
+        "opencode",
+        1_700_913_600_000,
+        full_tokens(),
+    );
+    let second = assistant_message(
+        "msg-b",
+        "ses-mixed",
+        "kimi-k3",
+        "opencode",
+        1_700_914_200_000,
+        full_tokens(),
+    );
+
+    let (_, a) = ingest(&first);
+    let (_, b) = ingest(&second);
+
+    assert_eq!(a.events.len(), 1);
+    assert_eq!(b.events.len(), 1);
+    assert_eq!(a.events[0].exact_model, "glm-5.3");
+    assert_eq!(b.events[0].exact_model, "kimi-k3");
+    assert_eq!(
+        a.events[0].session_id_hash, b.events[0].session_id_hash,
+        "same session, hashed identically"
+    );
+    assert_ne!(a.events[0].event_id, b.events[0].event_id);
+}
+
+#[test]
+fn truncated_message_file_fails_loudly_not_guessed() {
+    // A message file cut off mid-JSON is invalid; the adapter must not guess
+    // partial usage out of it. The collection layer contains this per-file.
+    let full = assistant_message(
+        "msg-1",
+        "ses-1",
+        "glm-5.3",
+        "opencode",
+        1_700_913_600_000,
+        full_tokens(),
+    );
+    let truncated = &full[..full.len() - 40];
+
+    let err = ingest_err(truncated);
+    assert!(
+        matches!(err, AiuError::UnrecognizedFormat { .. }),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn wholly_unrecognized_file_fails_loudly_for_go_only() {
     let err = ingest_err("{\"hello\":1}");
     match err {

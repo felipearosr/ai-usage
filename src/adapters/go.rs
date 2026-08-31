@@ -158,13 +158,10 @@ impl SourceAdapter for OpenCodeGoAdapter {
         if raw.trim().is_empty() {
             return Ok(ParseSummary::default());
         }
-        let doc: Value =
-            serde_json::from_str(raw.trim()).map_err(|e| AiuError::UnrecognizedFormat {
-                source: SOURCE,
-                detail: format!("quota capture is not valid JSON: {e}"),
-            })?;
+        let doc: Value = serde_json::from_str(raw.trim())
+            .map_err(|e| unrecognized(&format!("quota capture is not valid JSON: {e}")))?;
         let Some(obj) = doc.as_object() else {
-            return Err(unrecognized_quota("quota capture is not a JSON object"));
+            return Err(unrecognized("quota capture is not a JSON object"));
         };
         if obj.is_empty() {
             return Ok(ParseSummary::default()); // vendor reported nothing yet
@@ -176,26 +173,26 @@ impl SourceAdapter for OpenCodeGoAdapter {
         };
         for (key, value) in obj {
             let Some(window) = map_window(key) else {
-                return Err(unrecognized_quota(&format!("unknown quota window {key:?}")));
+                return Err(unrecognized(&format!("unknown quota window {key:?}")));
             };
             let entry = value
                 .as_object()
-                .ok_or_else(|| unrecognized_quota(&format!("window {key:?} is not an object")))?;
+                .ok_or_else(|| unrecognized(&format!("window {key:?} is not an object")))?;
             let used_percent = entry
                 .get("utilization")
                 .and_then(Value::as_f64)
                 .ok_or_else(|| {
-                    unrecognized_quota(&format!("window {key:?} has no numeric utilization"))
+                    unrecognized(&format!("window {key:?} has no numeric utilization"))
                 })?;
             let resets_at_utc = match entry.get("resets_at") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(s)) => {
                     Some(utc::parse_rfc3339_utc_loose(s).ok_or_else(|| {
-                        unrecognized_quota(&format!("window {key:?} has unparsable resets_at"))
+                        unrecognized(&format!("window {key:?} has unparsable resets_at"))
                     })?)
                 }
                 Some(_) => {
-                    return Err(unrecognized_quota(&format!(
+                    return Err(unrecognized(&format!(
                         "window {key:?} has non-string resets_at"
                     )))
                 }
@@ -221,10 +218,6 @@ fn unrecognized(detail: &str) -> AiuError {
         source: SOURCE,
         detail: detail.to_string(),
     }
-}
-
-fn unrecognized_quota(detail: &str) -> AiuError {
-    unrecognized(detail)
 }
 
 fn map_window(vendor_key: &str) -> Option<&'static str> {
@@ -292,33 +285,14 @@ fn parse_usage(record: &serde_json::Map<String, Value>) -> Option<ParsedMessage>
     let ts_utc = utc::format_epoch(created_ms.max(0) as u64 / 1000);
     let tokens = record.get("tokens")?.as_object()?;
 
-    // Required token classes: wrong-typed is malformed, absent is null.
-    let field = |key: &str| -> Option<Option<i64>> {
-        match tokens.get(key) {
-            None | Some(Value::Null) => Some(None),
-            Some(Value::Number(n)) => n.as_i64().map(Some),
-            Some(_) => None,
-        }
-    };
-    let input_tokens = field("input")?;
-    let output_tokens = field("output")?;
-    let reasoning_tokens = field("reasoning")?;
-
-    // Cache reads/writes are siblings to input; absent (older records) is
-    // null, wrong-typed is malformed.
-    let cache_field = |key: &str| -> Option<Option<i64>> {
-        match tokens
-            .get("cache")
-            .and_then(Value::as_object)
-            .and_then(|c| c.get(key))
-        {
-            None | Some(Value::Null) => Some(None),
-            Some(Value::Number(n)) => n.as_i64().map(Some),
-            Some(_) => None,
-        }
-    };
-    let cached_input_tokens = cache_field("read")?;
-    let cache_write_tokens = cache_field("write")?;
+    // Cache reads/writes are siblings to input (older records may omit them),
+    // so absent is null rather than malformed.
+    let cache = tokens.get("cache").and_then(Value::as_object);
+    let input_tokens = parse_opt_i64(tokens.get("input"))?;
+    let output_tokens = parse_opt_i64(tokens.get("output"))?;
+    let reasoning_tokens = parse_opt_i64(tokens.get("reasoning"))?;
+    let cached_input_tokens = parse_opt_i64(cache.and_then(|c| c.get("read")))?;
+    let cache_write_tokens = parse_opt_i64(cache.and_then(|c| c.get("write")))?;
 
     // Reported per-message cost in USD, preserved as integer micros. Absent or
     // null is unknown (null); wrong-typed is unknown, never coerced.
@@ -343,4 +317,16 @@ fn parse_usage(record: &serde_json::Map<String, Value>) -> Option<ParsedMessage>
         reasoning_tokens,
         reported_cost_micros,
     })
+}
+
+/// Three-state parse of an optional token field: absent or null → `Some(None)`
+/// (null downstream, never zero); a number → `Some(Some(count))`; wrong-typed →
+/// `None` (malformed, never coerced). The outer `None` makes the caller treat
+/// the whole record as unaccountable rather than guessing a value.
+fn parse_opt_i64(value: Option<&Value>) -> Option<Option<i64>> {
+    match value {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::Number(n)) => n.as_i64().map(Some),
+        Some(_) => None,
+    }
 }
