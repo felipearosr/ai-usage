@@ -194,7 +194,7 @@ pub(crate) fn latest_window_quotas(
             )
           ORDER BY q.window",
     )?;
-    let rows = stmt
+    let mut rows = stmt
         .query_map(params![source], |row| {
             Ok(WindowQuota {
                 window: row.get(0)?,
@@ -203,7 +203,23 @@ pub(crate) fn latest_window_quotas(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Canonical ordering (5h < week < month), not lexicographic: a source
+    // with a monthly window (Go) must render week before month, and unknown
+    // future windows sort last by name.
+    rows.sort_by(|a, b| window_order(&a.window).cmp(&window_order(&b.window)));
     Ok(rows)
+}
+
+/// Canonical window ordering key. Known rolling windows follow the spec's
+/// order (`5h` → `week` → `month`); anything else sorts after them, by name,
+/// so sorting never misbehaves on an unexpected window string.
+fn window_order(window: &str) -> (u8, &str) {
+    match window {
+        "5h" => (0, window),
+        "week" => (1, window),
+        "month" => (2, window),
+        _ => (3, window),
+    }
 }
 
 fn attribution(
