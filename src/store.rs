@@ -570,13 +570,15 @@ impl Store {
         Ok(changed == 1)
     }
 
-    pub(crate) fn pending_sync_records(&self) -> Result<Vec<PendingSyncRecord>> {
+    /// The oldest `limit` undelivered outbox rows. Paged so a deep queue is
+    /// uploaded in bounded batches rather than materialized all at once.
+    pub(crate) fn pending_sync_records(&self, limit: usize) -> Result<Vec<PendingSyncRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, payload FROM sync_outbox
-             WHERE sent_at_utc IS NULL ORDER BY id",
+             WHERE sent_at_utc IS NULL ORDER BY id LIMIT ?1",
         )?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params![limit as i64], |row| {
                 Ok(PendingSyncRecord {
                     outbox_id: row.get(0)?,
                     payload: row.get(1)?,

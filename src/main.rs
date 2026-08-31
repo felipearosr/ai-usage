@@ -60,6 +60,11 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Collect) => {
+            if let Err(e) = run_collect() {
+                die(1, e);
+            }
+        }
         Ok(Command::Init) => {
             if let Err(e) = run_init() {
                 die(1, e);
@@ -106,6 +111,53 @@ fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
         summary.uploaded, summary.downloaded, summary.duplicates_ignored
     );
     Ok(())
+}
+
+/// The scheduled pass: one full pipeline invocation, then exit. This is what
+/// the systemd timer and launchd agent invoke, so it must never wait for
+/// input, never stay resident, and never fail because the relay is down.
+fn run_collect() -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let identity = aiu::identity::ensure_local_identity(&store)?;
+    let home = setup_home()?;
+    let ctx = aiu::adapters::IngestContext {
+        device_id: identity.device_id,
+        workspace_id: identity.workspace_id,
+        now_epoch: aiu::utc::now_epoch(),
+    };
+
+    // A machine that has not paired collects and prunes locally; only a
+    // configured relay is contacted.
+    let mut relay = None;
+    let mut config = None;
+    if aiu::setup::is_initialized(&store)? {
+        match (
+            aiu::setup::load_sync_config(&store, 500),
+            aiu::relay::HttpRelayClient::from_env(),
+        ) {
+            (Ok(loaded), Ok(client)) => {
+                config = Some(loaded);
+                relay = Some(client);
+            }
+            (Err(error), _) => report_sync_unavailable(&error),
+            (_, Err(error)) => report_sync_unavailable(&error),
+        }
+    }
+
+    let run = aiu::pipeline::run(
+        &store,
+        &home,
+        &ctx,
+        relay.as_mut().map(|r| r as &mut dyn aiu::sync::RelayClient),
+        config.as_ref(),
+        aiu::utc::now_epoch(),
+    )?;
+    print!("{}", aiu::pipeline::render(&run));
+    Ok(())
+}
+
+fn report_sync_unavailable(error: &dyn std::fmt::Display) {
+    eprintln!("aiu: sync unavailable; collecting locally: {error}");
 }
 
 fn run_machine_rename(device: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -166,6 +218,8 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         aiu::utc::now_epoch(),
         &mut print_import_progress,
     )?;
+    let mut outcome = outcome;
+    outcome.scheduler = aiu::scheduler::install_default(&home, &mut aiu::scheduler::ProcessRunner);
     print!("{}", aiu::setup::render_init(&outcome));
     println!("Workspace setup is complete. Waiting for the joining machine...");
     println!("Press Ctrl-C if you are not pairing now; run `aiu init` later for a fresh code.");
@@ -212,6 +266,8 @@ fn run_join(code: &str) -> Result<(), Box<dyn std::error::Error>> {
             Err(error) => return Err(error.into()),
         }
     };
+    let mut outcome = outcome;
+    outcome.scheduler = aiu::scheduler::install_default(&home, &mut aiu::scheduler::ProcessRunner);
     print!("{}", aiu::setup::render_join(&outcome));
     sync_after_setup(&store, &mut relay);
     Ok(())

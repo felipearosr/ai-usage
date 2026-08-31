@@ -47,6 +47,7 @@ pub enum Command {
         device: String,
     },
     Sync,
+    Collect,
     Init,
     Join {
         code: String,
@@ -88,6 +89,7 @@ USAGE:
                                     rename a machine across the workspace
     aiu machine remove <device>     revoke a machine without deleting history
     aiu sync                        collect and synchronize now
+    aiu collect                     run the scheduled collection pass once
     aiu init                        create a workspace and pairing code
     aiu join <code>                 join an existing workspace
 
@@ -139,6 +141,10 @@ where
     match positionals.as_slice() {
         [] => Ok(Command::Report { json }),
         [command] if command == "sync" && !json => Ok(Command::Sync),
+        [command] if command == "collect" && !json => Ok(Command::Collect),
+        [command, ..] if command == "collect" => Err(ArgsError(format!(
+            "invalid collect command\nusage: aiu collect\n\n{USAGE}"
+        ))),
         [command, ..] if command == "sync" => Err(ArgsError(format!(
             "invalid sync command\nusage: aiu sync\n\n{USAGE}"
         ))),
@@ -235,6 +241,16 @@ mod tests {
     fn sync_is_recognized() {
         assert_eq!(parse(args(&["sync"])).unwrap(), Command::Sync);
         assert!(parse(args(&["sync", "--json"])).is_err());
+    }
+
+    #[test]
+    fn collect_is_recognized() {
+        assert_eq!(parse(args(&["collect"])).unwrap(), Command::Collect);
+        assert!(
+            parse(args(&["collect", "--json"])).is_err(),
+            "collect reports progress, not a JSON document"
+        );
+        assert!(parse(args(&["collect", "extra"])).is_err());
     }
 
     #[test]

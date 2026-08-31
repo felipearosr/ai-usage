@@ -18,6 +18,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::collect::{CollectProgress, SourceCollect};
+use crate::scheduler::Installation;
 use crate::store::{NewDevice, Store};
 use crate::sync::{SyncConfig, WorkspaceKey};
 
@@ -257,6 +258,10 @@ pub struct InitOutcome {
     pub detected_sources: Vec<&'static str>,
     pub imports: Vec<SourceCollect>,
     pub pairing: HostPairing,
+    /// Filled in by [`install_collection_schedule`] once setup has finished.
+    /// `None` means no scheduler was installed — an unsupported OS, or a
+    /// caller that installs one itself.
+    pub scheduler: Option<Installation>,
 }
 
 #[derive(Debug)]
@@ -265,6 +270,8 @@ pub struct JoinOutcome {
     pub device_id: String,
     pub detected_sources: Vec<&'static str>,
     pub imports: Vec<SourceCollect>,
+    /// See [`InitOutcome::scheduler`].
+    pub scheduler: Option<Installation>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -341,6 +348,7 @@ pub fn init_workspace_with_progress(
         detected_sources,
         imports,
         pairing,
+        scheduler: None,
     })
 }
 
@@ -513,6 +521,7 @@ pub fn finish_join_with_progress(
         device_id: attempt.device_id.clone(),
         detected_sources,
         imports,
+        scheduler: None,
     })
 }
 
@@ -546,8 +555,10 @@ pub fn render_init(outcome: &InitOutcome) -> String {
         .map(|item| item.events_imported)
         .sum();
     format!(
-        "Workspace created\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\nScheduler: automatic collection is not installed yet\nPair another machine within 10 minutes:\n  aiu join {}\n",
-        outcome.device_id, outcome.pairing_code
+        "Workspace created\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\nScheduler: {}\nPair another machine within 10 minutes:\n  aiu join {}\n",
+        outcome.device_id,
+        crate::scheduler::describe(outcome.scheduler.as_ref()),
+        outcome.pairing_code
     )
 }
 
@@ -563,8 +574,9 @@ pub fn render_join(outcome: &JoinOutcome) -> String {
         .map(|item| item.events_imported)
         .sum();
     format!(
-        "Joined workspace\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\n",
-        outcome.device_id
+        "Joined workspace\nMachine: {}\nDetected sources: {sources}\nImported: {imported} usage records\nScheduler: {}\n",
+        outcome.device_id,
+        crate::scheduler::describe(outcome.scheduler.as_ref())
     )
 }
 
