@@ -21,6 +21,9 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # The spec's ≲100 ms rendering target is asserted only against an
+      # optimized build, so a debug-only run would never enforce it.
+      - run: cargo test --release --test performance
 
   # The installer is a shell script that runs before aiu exists, so it is
   # linted separately from the Rust build.

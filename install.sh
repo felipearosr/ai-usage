@@ -7,23 +7,26 @@
 # directory or the collection schedule is touched, so this doubles as the
 # upgrade path.
 #
+# Integrity is a SHA256 checksum over HTTPS. That catches a corrupted or
+# truncated download and a substituted asset, but not a compromised release:
+# an attacker who can replace the artifact can replace SHA256SUMS with it.
+# Closing that gap needs a signing key pinned in this script, which the
+# project does not have yet. Signature verification is therefore not
+# implemented rather than half-implemented — a signature check that can be
+# skipped when the signature is absent verifies nothing, because suppressing
+# it is the first thing an attacker does.
+#
 # Environment:
-#   AIU_VERSION         install this version instead of the latest
-#   AIU_INSTALL_DIR     where to put the binary (default ~/.local/bin)
-#   AIU_BASE_URL        release tree to fetch from
-#   AIU_UNAME_S/_M      override platform detection (kernel / machine)
-#   AIU_PUBKEY          minisign public key to verify SHA256SUMS against
-#   AIU_SKIP_SIGNATURE  proceed when a published signature cannot be checked
+#   AIU_VERSION       install this version instead of the latest
+#   AIU_INSTALL_DIR   where to put the binary (default ~/.local/bin)
+#   AIU_BASE_URL      release tree to fetch from
+#   AIU_UNAME_S/_M    override platform detection (kernel / machine)
 
 set -eu
 
 REPO_URL="https://github.com/felipearosr/ai-usage"
 BASE_URL="${AIU_BASE_URL:-$REPO_URL/releases}"
 INSTALL_DIR="${AIU_INSTALL_DIR:-${HOME:-.}/.local/bin}"
-# The minisign public key releases are signed with. Empty until a release
-# signing key exists; an unsigned release publishes no .minisig, so the
-# signature path below stays dormant rather than silently passing.
-PUBKEY="${AIU_PUBKEY:-}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'aiu: %s\n' "$*" >&2; exit 1; }
@@ -94,28 +97,23 @@ verify_checksum() {
     || die "checksum mismatch for $1 (expected $expected, got $actual); refusing to install"
 }
 
-# A signature is published or it is not. When it is, failing to check it is a
-# refusal rather than a warning — a warning printed inside `curl | sh` scrolls
-# past exactly when it matters most.
-verify_signature() {
-  fetch "$release_url/SHA256SUMS.minisig" "$tmp/SHA256SUMS.minisig" 2>/dev/null || return 0
-  if [ -n "${AIU_SKIP_SIGNATURE:-}" ]; then
-    say "aiu: skipping signature verification (AIU_SKIP_SIGNATURE is set)"
-    return 0
-  fi
-  [ -n "$PUBKEY" ] \
-    || die "this release is signed but this installer carries no trusted key; supply one with AIU_PUBKEY, or re-run with AIU_SKIP_SIGNATURE=1 to rely on the checksum alone"
-  command -v minisign >/dev/null 2>&1 \
-    || die "this release is signed but minisign is not installed; install it, or re-run with AIU_SKIP_SIGNATURE=1 to rely on the checksum alone"
-  # A signature that is present and checkable but wrong is an attack signal,
-  # not an inconvenience: no opt-out is offered here.
-  minisign -V -P "$PUBKEY" -m "$tmp/SHA256SUMS" >/dev/null 2>&1 \
-    || die "signature verification failed for SHA256SUMS; refusing to install"
+cleanup() {
+  [ -n "${tmp:-}" ] && rm -rf "$tmp"
+  # The staging file lives in the install directory, not $tmp, so removing
+  # $tmp alone would leave it behind on an interrupted run.
+  [ -n "${staged:-}" ] && rm -f "$staged"
+  return 0
 }
 
 main() {
+  tmp=""
+  staged=""
+  trap cleanup EXIT
+  # A bare cleanup handler for INT/TERM would tidy up and then let the script
+  # carry on with its temporary directory deleted. Re-raising exits.
+  trap 'cleanup; trap - INT; kill -INT $$' INT
+  trap 'cleanup; exit 143' TERM
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/aiu-install.XXXXXX")
-  trap 'rm -rf "$tmp"' EXIT INT TERM
 
   target=$(detect_target)
   version=$(resolve_version)
@@ -129,7 +127,6 @@ main() {
     || die "could not download the checksums for $version; refusing to install unverified"
 
   verify_checksum "$archive"
-  verify_signature
 
   tar -xzf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive"
   [ -f "$tmp/aiu" ] || die "$archive does not contain an aiu binary"
@@ -145,8 +142,8 @@ main() {
   staged="$INSTALL_DIR/.aiu.install.$$"
   cp "$tmp/aiu" "$staged" || die "could not write to $INSTALL_DIR"
   chmod +x "$staged"
-  mv -f "$staged" "$INSTALL_DIR/aiu" \
-    || { rm -f "$staged"; die "could not install into $INSTALL_DIR"; }
+  mv -f "$staged" "$INSTALL_DIR/aiu" || die "could not install into $INSTALL_DIR"
+  staged=""
 
   say "aiu: installed $INSTALL_DIR/aiu"
   case ":${PATH:-}:" in

@@ -2,19 +2,24 @@
 //! effectively instantaneous and independent of network latency, so that the
 //! CLI feels like `git status`" — spec target ≲100 ms.
 //!
+//! Timed by running the real `aiu` binary, not by calling `report::build` in
+//! process. "Feels like `git status`" is a claim about what a user waits for,
+//! which includes process start, opening the database, and the quick local
+//! refresh every report command performs before rendering — none of which a
+//! library-level measurement would see.
+//!
 //! Its own test binary, like `collect_memory.rs`: a wall-clock budget measured
 //! next to other tests running in parallel measures the harness rather than
-//! the query path.
+//! the work.
 //!
 //! The database is filled to the retention ceiling — a full year of events
 //! across every source, machine and model — because that is the largest local
-//! report aiu can be asked to render before pruning takes over. The store is
-//! file-backed so real SQLite I/O is included, not an in-memory shortcut.
+//! report aiu can be asked to render before pruning takes over.
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
-use aiu::report::{self, breakdown, detail};
 use aiu::store::{NewDevice, Store};
 use aiu::utc;
 
@@ -29,7 +34,7 @@ const MODELS: [&str; 3] = ["a", "b", "c"];
 const DAYS: u64 = 365;
 const EVENTS_PER_DAY_PER_DEVICE: usize = 8;
 
-/// `cargo test --release` measures the binary users actually run, so it holds
+/// `cargo test --release` builds the binary users actually run, so it holds
 /// the spec's 100 ms target directly. An unoptimized build compiles SQLite's
 /// bundled C without optimization and inlines nothing, so a debug run is
 /// several times slower for reasons that say nothing about the query path;
@@ -41,11 +46,12 @@ const BUDGET: Duration = if cfg!(debug_assertions) {
     Duration::from_millis(100)
 };
 
-fn temp_db() -> PathBuf {
+fn temp_root() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("aiu-perf-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir.join("usage.db")
+    std::fs::create_dir_all(dir.join("home")).unwrap();
+    std::fs::create_dir_all(dir.join("data")).unwrap();
+    dir
 }
 
 fn populate(store: &Store) {
@@ -114,15 +120,33 @@ fn populate(store: &Store) {
     tx.commit().unwrap();
 }
 
-/// Runs a render a few times and returns the fastest, so an unlucky scheduler
-/// slice on a shared CI box does not decide whether the query path regressed.
-fn best_of<T>(times: usize, mut render: impl FnMut() -> T) -> Duration {
-    (0..times)
+/// Runs a command a few times and returns the fastest, so an unlucky
+/// scheduler slice on a shared CI box does not decide whether the query path
+/// regressed.
+fn best_of(root: &std::path::Path, args: &[&str]) -> Duration {
+    (0..5)
         .map(|_| {
             let start = Instant::now();
-            let value = render();
+            let out = Command::new(env!("CARGO_BIN_EXE_aiu"))
+                .args(args)
+                .env_clear()
+                .env("PATH", std::env::var("PATH").unwrap_or_default())
+                .env("HOME", root.join("home"))
+                .env("AIU_DATA_DIR", root.join("data"))
+                .output()
+                .unwrap();
             let elapsed = start.elapsed();
-            std::hint::black_box(value);
+            assert!(
+                out.status.success(),
+                "`aiu {}` failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !out.stdout.is_empty(),
+                "`aiu {}` rendered nothing, so its timing means nothing",
+                args.join(" ")
+            );
             elapsed
         })
         .min()
@@ -131,50 +155,42 @@ fn best_of<T>(times: usize, mut render: impl FnMut() -> T) -> Duration {
 
 #[test]
 fn every_local_report_renders_within_the_latency_budget() {
-    let path = temp_db();
-    let store = Store::open(&path).unwrap();
-    populate(&store);
-
-    let mut measured: Vec<(&str, Duration)> = Vec::new();
-
-    measured.push((
-        "aiu",
-        best_of(5, || {
-            report::text::render(&report::build(&store, NOW).unwrap())
-        }),
-    ));
-    measured.push((
-        "aiu machines",
-        best_of(5, || {
-            report::fleet::render_text(&report::fleet::build(&store, NOW).unwrap())
-        }),
-    ));
-    for source in SOURCES {
-        measured.push((
-            source,
-            best_of(5, || {
-                detail::text::render(&detail::build(&store, source, NOW).unwrap())
-            }),
-        ));
-        measured.push((
-            "breakdown",
-            best_of(5, || {
-                breakdown::text::render_models(&breakdown::build(&store, source, NOW).unwrap())
-            }),
-        ));
+    let root = temp_root();
+    {
+        let store = Store::open(&root.join("data/usage.db")).unwrap();
+        populate(&store);
     }
 
-    let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    // Every report command in the spec's §100 surface that renders locally.
+    let mut commands: Vec<Vec<&str>> = vec![vec![], vec!["machines"], vec!["status"]];
+    for source in SOURCES {
+        commands.push(vec![source]);
+        commands.push(vec![source, "models"]);
+        commands.push(vec![source, "machines"]);
+    }
+
+    let measured: Vec<(String, Duration)> = commands
+        .iter()
+        .map(|args| {
+            (
+                format!("aiu {}", args.join(" ")).trim_end().to_string(),
+                best_of(&root, args),
+            )
+        })
+        .collect();
+
+    let _ = std::fs::remove_dir_all(&root);
 
     let events = DAYS as usize * DEVICES * EVENTS_PER_DAY_PER_DEVICE;
+    // Printed first so a failing run still records every number, not just the
+    // one that tripped the budget.
+    for (name, elapsed) in &measured {
+        println!("{name:<20} {elapsed:?}");
+    }
     for (name, elapsed) in &measured {
         assert!(
             *elapsed < BUDGET,
             "`{name}` took {elapsed:?} over {events} events, budget {BUDGET:?}"
         );
-    }
-    // Printed so a run records the real numbers, not just that they passed.
-    for (name, elapsed) in &measured {
-        println!("{name:<16} {elapsed:?}");
     }
 }

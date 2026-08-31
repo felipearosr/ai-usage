@@ -56,7 +56,6 @@ impl Cli {
         }
     }
 
-    /// Runs a command that must succeed, returning its stdout.
     /// Stands in for a completed `aiu init`: the workspace secrets a paired
     /// machine holds, written straight into the same database the CLI opens.
     /// `aiu init` itself needs a relay and a terminal, neither of which
@@ -77,6 +76,49 @@ impl Cli {
         assert!(!identity.device_id.is_empty());
     }
 
+    /// Writes real usage into the same database the CLI opens, so a report
+    /// has something to get wrong. Without it the report assertions only
+    /// prove a command exits zero over an empty table.
+    fn seed(&self) {
+        let store = aiu::store::Store::open(&self.root.join("data/usage.db")).unwrap();
+        store
+            .ensure_device(&aiu::store::NewDevice {
+                device_id: "seeded-device".into(),
+                friendly_name: "seeded-machine".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                last_sync_at_utc: Some(aiu::utc::now_rfc3339()),
+            })
+            .unwrap();
+        let now = aiu::utc::now_epoch();
+        for (index, source) in SOURCES.iter().enumerate() {
+            store
+                .record_event(&aiu::store::NewEvent {
+                    event_id: format!("seeded-{source}"),
+                    workspace_id: "ws".into(),
+                    device_id: "seeded-device".into(),
+                    source: (*source).into(),
+                    tool: (*source).into(),
+                    exact_model: format!("{source}-exact-model-2026"),
+                    ts_utc: aiu::utc::format_epoch(now - 600),
+                    output_tokens: Some(1_000 + index as i64),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .record_snapshot(&aiu::store::NewSnapshot {
+                    source: (*source).into(),
+                    window: "5h".into(),
+                    used_percent: 42.0,
+                    resets_at_utc: Some(aiu::utc::format_epoch(now + 3_600)),
+                    observed_at_utc: aiu::utc::format_epoch(now - 60),
+                    observing_device_id: "seeded-device".into(),
+                })
+                .unwrap();
+        }
+    }
+
+    /// Runs a command that must succeed, returning its stdout.
     fn ok(&self, args: &[&str]) -> String {
         let run = self.run(args);
         assert!(
@@ -109,12 +151,13 @@ fn as_json(output: &str) -> serde_json::Value {
 const SOURCES: [&str; 3] = ["claude", "codex", "go"];
 
 #[test]
-fn every_report_command_runs_and_its_json_parses() {
+fn every_report_command_runs_on_a_fresh_install() {
+    // A fresh install has no data, which is the case most likely to divide by
+    // zero or render an empty table badly. Here the bar is only that every
+    // command exits cleanly and any JSON parses; the seeded test below is
+    // what checks the numbers actually reach the output.
     let cli = Cli::new();
 
-    // Compact overview, then each per-source detail view and both breakdowns,
-    // in text and JSON. A fresh install has no data, which is the case most
-    // likely to divide by zero or render an empty table badly.
     assert!(
         !cli.ok(&[]).is_empty(),
         "the compact report should say something"
@@ -132,6 +175,48 @@ fn every_report_command_runs_and_its_json_parses() {
 
     assert!(!cli.ok(&["machines"]).is_empty());
     as_json(&cli.ok(&["machines", "--json"]));
+}
+
+#[test]
+fn seeded_usage_reaches_every_report_that_should_show_it() {
+    let cli = Cli::new();
+    cli.seed();
+
+    // The compact overview carries every source's window and its top model,
+    // under the exact model id — never collapsed into a family name.
+    let overview = as_json(&cli.ok(&["--json"]));
+    let sources = overview["sources"].as_array().expect("sources array");
+    for source in SOURCES {
+        let entry = sources
+            .iter()
+            .find(|entry| entry["source"] == source)
+            .unwrap_or_else(|| panic!("{source} should appear in the overview: {overview}"));
+        assert_eq!(
+            entry["windows"][0]["used_percent"], 42.0,
+            "the recorded quota should be the one reported: {entry}"
+        );
+        assert_eq!(
+            entry["top_model"]["name"],
+            format!("{source}-exact-model-2026"),
+            "the exact model id should survive to the report: {entry}"
+        );
+    }
+
+    // The machine's friendly name reaches the fleet view and the per-source
+    // machine breakdowns; the exact model reaches the model matrix.
+    assert!(cli.ok(&["machines"]).contains("seeded-machine"));
+    for source in SOURCES {
+        let text = cli.ok(&[source, "machines"]);
+        assert!(
+            text.contains("seeded-machine"),
+            "`aiu {source} machines` should attribute usage to the machine:\n{text}"
+        );
+        let models = cli.ok(&[source, "models"]);
+        assert!(
+            models.contains(&format!("{source}-exact-model-2026")),
+            "`aiu {source} models` should list the exact model:\n{models}"
+        );
+    }
 }
 
 #[test]
@@ -223,15 +308,13 @@ fn sync_without_a_workspace_explains_itself_rather_than_panicking() {
     let run = cli.run(&["sync"]);
     let text = format!("{}{}", run.stdout, run.stderr);
     assert!(
-        !text.contains("panicked"),
-        "`aiu sync` must not panic before setup: {text}"
+        !run.ok,
+        "syncing without a workspace has nothing to sync and must not claim success: {text}"
     );
-    if !run.ok {
-        assert!(
-            text.starts_with("aiu:") || text.contains("init") || text.contains("join"),
-            "an unpaired sync should point at setup: {text}"
-        );
-    }
+    assert!(
+        text.contains("init") && text.contains("join"),
+        "an unpaired sync should name both ways to set one up: {text}"
+    );
 }
 
 #[test]

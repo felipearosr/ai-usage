@@ -16,6 +16,24 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # A tag must not publish a binary nothing ran the tests against.
+  verify:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # The release build is the one users get, so the spec's latency target
+      # is enforced against an optimized build here rather than assumed.
+      - run: cargo test --release --test performance
+
   build:
     name: build ${{ matrix.target }}
     strategy:
@@ -30,11 +48,12 @@ jobs:
             os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
+    needs: verify
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -48,15 +67,25 @@ jobs:
 
       # The archive holds a bare `aiu` at its root: the installer unpacks it
       # into a temporary directory and expects exactly that name.
+      # The tag names the version; Cargo.toml must agree, or the artifacts
+      # would be named for a version that release cannot be resolved from.
+      # Both jobs derive it this one way, so they cannot disagree.
+      - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          version="${TAG#v}"
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "$version" = "$declared" ] \
+            || { echo "tag $TAG does not match crate version $declared" >&2; exit 1; }
+          echo "AIU_VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Package
         run: |
           set -eu
-          version=$(cargo metadata --format-version 1 --no-deps \
-            | sed -n 's/.*"name":"aiu","version":"\([^"]*\)".*/\1/p')
-          [ -n "$version" ] || { echo "could not read the crate version" >&2; exit 1; }
-          echo "AIU_VERSION=$version" >> "$GITHUB_ENV"
           mkdir -p dist
-          tar -czf "dist/aiu-$version-${{ matrix.target }}.tar.gz" \
+          tar -czf "dist/aiu-$AIU_VERSION-${{ matrix.target }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" aiu
 
       - uses: actions/upload-artifact@v4
@@ -72,22 +101,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
       - uses: actions/download-artifact@v4
         with:
           path: staging
           merge-multiple: true
 
-      # The tag is the source of truth for what is being published; a tag that
-      # disagrees with Cargo.toml would produce artifact names the installer
-      # cannot resolve from that tag's release.
-      - name: Check the tag matches the crate version
+      - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -eu
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          [ "$tag" = "v$version" ] \
-            || { echo "tag $tag does not match crate version $version" >&2; exit 1; }
+          version="${TAG#v}"
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "$version" = "$declared" ] \
+            || { echo "tag $TAG does not match crate version $declared" >&2; exit 1; }
           echo "AIU_VERSION=$version" >> "$GITHUB_ENV"
 
       # Checksums are what the installer verifies against, so they are
@@ -116,9 +144,12 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -eu
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          gh release create "$tag" --title "$tag" --generate-notes \
-            || gh release edit "$tag" --title "$tag"
-          gh release upload "$tag" staging/* --clobber
+          # Create only when the release does not exist yet. Swallowing every
+          # `create` failure would hide a real one and upload into nothing.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" staging/* --clobber

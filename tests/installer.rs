@@ -7,7 +7,7 @@
 //!
 //! This seam owns: platform/arch → artifact selection for all four targets,
 //! integrity verification (a tampered or unlisted artifact is refused before
-//! anything is written), signature handling, and upgrade-in-place.
+//! anything is written), and upgrade-in-place.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -308,7 +308,11 @@ fn unsupported_platform_is_refused_by_name() {
 }
 
 #[test]
-fn a_published_signature_is_enforced_rather_than_ignored() {
+fn a_stray_signature_file_does_not_change_what_is_verified() {
+    // The installer makes no signature claim: there is no signing key to
+    // check one against. What matters is that publishing a `.minisig`
+    // neither weakens the checksum check nor silently appears to strengthen
+    // it, so that nobody reads the file's presence as verification.
     let sandbox = Sandbox::new("signature");
     let release = sandbox.publish("1.2.3");
     fs::write(
@@ -317,26 +321,19 @@ fn a_published_signature_is_enforced_rather_than_ignored() {
     )
     .unwrap();
 
-    // Publishing a signature the machine cannot check must fail closed. The
-    // alternative — installing anyway with a warning — is the failure mode
-    // signing exists to prevent.
-    let out = sandbox.install(Some(("Linux", "x86_64")), &[]);
-    assert!(
-        !out.ok,
-        "an unverifiable signature must refuse the install: {}",
-        out.all()
-    );
-    assert!(sandbox.installed().is_none());
-    assert!(
-        out.all().contains("AIU_SKIP_SIGNATURE"),
-        "the refusal should say how to proceed deliberately: {}",
-        out.all()
-    );
-
-    // The opt-out is explicit and per-run, never the default.
-    let out = sandbox.install(Some(("Linux", "x86_64")), &[("AIU_SKIP_SIGNATURE", "1")]);
-    assert!(out.ok, "{}", out.all());
+    assert!(sandbox.install(Some(("Linux", "x86_64")), &[]).ok);
     assert!(sandbox.installed().is_some());
+
+    // The checksum still governs: a tampered artifact is refused whether or
+    // not a signature file sits beside it.
+    fs::write(
+        release.artifact("x86_64-unknown-linux-musl"),
+        b"totally not a tarball",
+    )
+    .unwrap();
+    let out = sandbox.install(Some(("Linux", "x86_64")), &[]);
+    assert!(!out.ok, "{}", out.all());
+    assert!(out.all().to_lowercase().contains("checksum"));
 }
 
 #[test]
