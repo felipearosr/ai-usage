@@ -191,3 +191,168 @@ fn pruning_is_idempotent() {
     assert_eq!(first.usage_events, 1);
     assert_eq!(second.total(), 0, "second pass has nothing left to prune");
 }
+
+/// Device retention (issue 15). Spec §88: "Machine removal revokes sync
+/// access but preserves history until retention expiry" — so a revoked
+/// device's row outlives its usage, but not indefinitely.
+mod devices {
+    use super::*;
+
+    fn revoked_device(store: &Store, id: &str, revoked_days_ago: u64) {
+        store
+            .ensure_device(&aiu::store::NewDevice {
+                device_id: id.into(),
+                friendly_name: id.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                last_sync_at_utc: None,
+            })
+            .unwrap();
+        store
+            .mark_device_revoked(id, &at(revoked_days_ago * DAY))
+            .unwrap();
+    }
+
+    fn live_device(store: &Store, id: &str) {
+        store
+            .ensure_device(&aiu::store::NewDevice {
+                device_id: id.into(),
+                friendly_name: id.into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                last_sync_at_utc: None,
+            })
+            .unwrap();
+    }
+
+    fn event_for(device_id: &str, id: &str, age_days: u64) -> NewEvent {
+        NewEvent {
+            device_id: device_id.into(),
+            ..event(id, age_days)
+        }
+    }
+
+    fn device_exists(store: &Store, id: &str) -> bool {
+        store
+            .conn()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE device_id = ?1)",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_revoked_device_whose_history_has_expired_is_pruned() {
+        let store = store_with_device();
+        revoked_device(&store, "dev-gone", 400);
+        store
+            .record_event(&event_for("dev-gone", "ancient", 400))
+            .unwrap();
+        store.set_device_source("dev-gone", "claude", true).unwrap();
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(summary.usage_events, 1);
+        assert_eq!(summary.devices, 1, "the device goes once its history has");
+        assert!(!device_exists(&store, "dev-gone"));
+        let sources: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM device_sources WHERE device_id = 'dev-gone'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(sources, 0, "its source rows go with it, leaving no orphans");
+    }
+
+    #[test]
+    fn a_revoked_device_with_history_still_in_window_is_kept() {
+        // Reports must keep attributing usage that is still inside retention.
+        let store = store_with_device();
+        revoked_device(&store, "dev-recent", 400);
+        store
+            .record_event(&event_for("dev-recent", "still-here", 30))
+            .unwrap();
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(summary.devices, 0);
+        assert!(device_exists(&store, "dev-recent"));
+    }
+
+    #[test]
+    fn a_recently_revoked_device_is_kept_even_with_no_history() {
+        let store = store_with_device();
+        revoked_device(&store, "dev-fresh-revoke", 10);
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(
+            summary.devices, 0,
+            "the revocation itself is still in window"
+        );
+        assert!(device_exists(&store, "dev-fresh-revoke"));
+    }
+
+    #[test]
+    fn a_device_that_merely_went_quiet_is_never_pruned() {
+        // A quiet machine may come back; only an explicit revocation retires
+        // a device.
+        let store = store_with_device();
+        live_device(&store, "dev-quiet");
+        store
+            .record_event(&event_for("dev-quiet", "old", 400))
+            .unwrap();
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(summary.usage_events, 1, "its history still expires");
+        assert_eq!(summary.devices, 0);
+        assert!(device_exists(&store, "dev-quiet"));
+    }
+
+    #[test]
+    fn the_local_device_is_never_pruned() {
+        let store = store_with_device();
+        store.set_metadata("device_id", "dev-a").unwrap();
+        store.mark_device_revoked("dev-a", &at(400 * DAY)).unwrap();
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(summary.devices, 0, "this machine keeps its own row");
+        assert!(device_exists(&store, "dev-a"));
+    }
+
+    #[test]
+    fn a_revoked_device_holding_only_a_quota_snapshot_is_kept() {
+        let store = store_with_device();
+        revoked_device(&store, "dev-snap", 400);
+        store
+            .record_snapshot(&NewSnapshot {
+                observing_device_id: "dev-snap".into(),
+                ..snapshot(30, 42.0)
+            })
+            .unwrap();
+
+        let summary = retention::prune(&store, NOW).unwrap();
+
+        assert_eq!(
+            summary.devices, 0,
+            "an in-window observation is history too"
+        );
+        assert!(device_exists(&store, "dev-snap"));
+    }
+
+    #[test]
+    fn device_pruning_is_idempotent() {
+        let store = store_with_device();
+        revoked_device(&store, "dev-gone", 400);
+        let first = retention::prune(&store, NOW).unwrap();
+        let second = retention::prune(&store, NOW).unwrap();
+        assert_eq!(first.devices, 1);
+        assert_eq!(second.devices, 0);
+    }
+}

@@ -142,8 +142,7 @@ fn installing_on_linux_writes_user_units_and_enables_the_timer() {
     let root = temp_root("linux");
     let mut runner = RecordingRunner::default();
 
-    let installed =
-        scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
+    let installed = scheduler::install(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
 
     let unit_dir = root.join(".config/systemd/user");
     assert!(unit_dir.join("aiu-collect.service").is_file());
@@ -177,8 +176,7 @@ fn installing_on_macos_writes_a_launch_agent_and_loads_it() {
     let root = temp_root("macos");
     let mut runner = RecordingRunner::default();
 
-    let installed =
-        scheduler::install_with_config(Platform::MacOs, &root, None, &spec(), &mut runner).unwrap();
+    let installed = scheduler::install(Platform::MacOs, &root, None, &spec(), &mut runner).unwrap();
 
     let plist = root.join("Library/LaunchAgents/com.aiu.collect.plist");
     assert!(plist.is_file());
@@ -202,11 +200,9 @@ fn reinstalling_is_idempotent_and_rewrites_the_units() {
     let root = temp_root("idempotent");
     let mut runner = RecordingRunner::default();
 
-    scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
+    scheduler::install(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
     let updated = ScheduleSpec::new(PathBuf::from("/opt/aiu")).every_minutes(20);
-    let second =
-        scheduler::install_with_config(Platform::Linux, &root, None, &updated, &mut runner)
-            .unwrap();
+    let second = scheduler::install(Platform::Linux, &root, None, &updated, &mut runner).unwrap();
 
     let service = read(&root.join(".config/systemd/user/aiu-collect.service"));
     assert!(
@@ -230,8 +226,7 @@ fn a_failed_activation_still_leaves_the_units_on_disk() {
         ..RecordingRunner::default()
     };
 
-    let installed =
-        scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
+    let installed = scheduler::install(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
 
     assert!(!installed.activated, "activation failure is reported");
     assert!(
@@ -283,8 +278,8 @@ fn dump_units_for_inspection() {
     };
     let root = PathBuf::from(dir);
     let mut runner = RecordingRunner::default();
-    scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
-    scheduler::install_with_config(Platform::MacOs, &root, None, &spec(), &mut runner).unwrap();
+    scheduler::install(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
+    scheduler::install(Platform::MacOs, &root, None, &spec(), &mut runner).unwrap();
 }
 
 /// A machine paired against a non-default relay, or using a non-default data
@@ -461,4 +456,232 @@ fn a_control_carrying_value_never_reaches_a_rendered_unit() {
     let plist = scheduler::render_launchd_plist(&spec);
     assert!(!plist.contains("/bin/sh"), "{plist}");
     assert!(plist.contains("<key>AIU_DATA_DIR</key>"), "{plist}");
+}
+
+/// Schedule lifecycle (issue 14): reading an installed schedule back off
+/// disk, detecting drift against the current environment, and removing it.
+mod lifecycle {
+    use super::*;
+    use aiu::scheduler::{Drift, InstalledSchedule};
+
+    fn spec_with_env() -> ScheduleSpec {
+        ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+            .every_minutes(20)
+            .with_environment(vec![
+                (
+                    "AIU_RELAY_URL".to_string(),
+                    "https://relay.example".to_string(),
+                ),
+                ("AIU_DATA_DIR".to_string(), "/srv/aiu".to_string()),
+            ])
+    }
+
+    /// The unit files are the scheduled state, so what was installed has to be
+    /// recoverable from them alone — not from a sidecar that could desync.
+    #[test]
+    fn an_installed_schedule_round_trips_through_the_unit_files() {
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let root = temp_root(&format!("roundtrip-{platform:?}"));
+            let mut runner = RecordingRunner::default();
+            let spec = spec_with_env();
+            scheduler::install(platform, &root, None, &spec, &mut runner).unwrap();
+
+            let read = scheduler::read_installed(platform, &root, None)
+                .unwrap_or_else(|| panic!("{platform:?} schedule reads back"));
+
+            assert_eq!(read.platform, platform);
+            assert_eq!(read.exe, spec.exe, "{platform:?}");
+            assert_eq!(read.interval_minutes, 20, "{platform:?}");
+            assert_eq!(read.environment, spec.environment, "{platform:?}");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    /// Values that needed escaping on the way in must come back out intact,
+    /// or drift detection would report a difference that is not real.
+    #[test]
+    fn values_needing_escaping_survive_the_round_trip() {
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let root = temp_root(&format!("escape-roundtrip-{platform:?}"));
+            let mut runner = RecordingRunner::default();
+            let spec = ScheduleSpec::new(PathBuf::from("/opt/a&b/aiu")).with_environment(vec![(
+                "AIU_RELAY_URL".to_string(),
+                r#"https://h/a%20b&c"d\e"#.to_string(),
+            )]);
+            scheduler::install(platform, &root, None, &spec, &mut runner).unwrap();
+
+            let read = scheduler::read_installed(platform, &root, None).unwrap();
+
+            assert_eq!(read.exe, spec.exe, "{platform:?}");
+            assert_eq!(read.environment, spec.environment, "{platform:?}");
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn nothing_is_read_back_when_no_schedule_is_installed() {
+        let root = temp_root("absent");
+        assert!(scheduler::read_installed(Platform::Linux, &root, None).is_none());
+        assert!(scheduler::read_installed(Platform::MacOs, &root, None).is_none());
+        assert!(!scheduler::is_installed(Platform::Linux, &root, None));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_partially_present_install_does_not_read_back_as_installed() {
+        // A systemd install is two files; one alone is not a schedule.
+        let root = temp_root("partial");
+        let mut runner = RecordingRunner::default();
+        scheduler::install(Platform::Linux, &root, None, &spec_with_env(), &mut runner).unwrap();
+        std::fs::remove_file(root.join(".config/systemd/user/aiu-collect.timer")).unwrap();
+
+        assert!(!scheduler::is_installed(Platform::Linux, &root, None));
+        assert!(scheduler::read_installed(Platform::Linux, &root, None).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unchanged_environment_reports_no_drift() {
+        let installed = InstalledSchedule {
+            platform: Platform::Linux,
+            exe: PathBuf::from("/usr/local/bin/aiu"),
+            interval_minutes: 20,
+            environment: spec_with_env().environment,
+            unit_paths: Vec::new(),
+        };
+        assert!(scheduler::drift(&installed, &spec_with_env()).is_empty());
+    }
+
+    /// Drift has to name the value that changed: "your schedule is stale" is
+    /// not something a user can act on.
+    #[test]
+    fn drift_names_each_value_that_changed() {
+        let installed = InstalledSchedule {
+            platform: Platform::Linux,
+            exe: PathBuf::from("/old/bin/aiu"),
+            interval_minutes: 15,
+            environment: vec![
+                (
+                    "AIU_RELAY_URL".to_string(),
+                    "https://old.example".to_string(),
+                ),
+                ("AIU_DATA_DIR".to_string(), "/srv/aiu".to_string()),
+            ],
+            unit_paths: Vec::new(),
+        };
+        let current = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+            .every_minutes(20)
+            .with_environment(vec![
+                (
+                    "AIU_RELAY_URL".to_string(),
+                    "https://new.example".to_string(),
+                ),
+                (
+                    "XDG_DATA_HOME".to_string(),
+                    "/home/me/.local/share".to_string(),
+                ),
+            ]);
+
+        let drift = scheduler::drift(&installed, &current);
+
+        assert!(drift.contains(&Drift::ExePath {
+            installed: PathBuf::from("/old/bin/aiu"),
+            current: PathBuf::from("/usr/local/bin/aiu"),
+        }));
+        assert!(drift.contains(&Drift::Interval {
+            installed: 15,
+            current: 20
+        }));
+        assert!(drift.contains(&Drift::Environment {
+            key: "AIU_RELAY_URL".to_string(),
+            installed: Some("https://old.example".to_string()),
+            current: Some("https://new.example".to_string()),
+        }));
+        assert!(
+            drift.contains(&Drift::Environment {
+                key: "AIU_DATA_DIR".to_string(),
+                installed: Some("/srv/aiu".to_string()),
+                current: None,
+            }),
+            "a variable that is no longer set is drift too: {drift:?}"
+        );
+        assert!(drift.contains(&Drift::Environment {
+            key: "XDG_DATA_HOME".to_string(),
+            installed: None,
+            current: Some("/home/me/.local/share".to_string()),
+        }));
+    }
+
+    /// This is the failure the drift check exists for: a data directory that
+    /// changed after install means the timer collects into one database while
+    /// reports read another.
+    #[test]
+    fn a_changed_data_directory_is_reported_as_drift() {
+        let installed = InstalledSchedule {
+            platform: Platform::Linux,
+            exe: PathBuf::from("/usr/local/bin/aiu"),
+            interval_minutes: 15,
+            environment: vec![("AIU_DATA_DIR".to_string(), "/old/db".to_string())],
+            unit_paths: Vec::new(),
+        };
+        let current = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+            .with_environment(vec![("AIU_DATA_DIR".to_string(), "/new/db".to_string())]);
+
+        let drift = scheduler::drift(&installed, &current);
+        assert_eq!(drift.len(), 1);
+        assert!(scheduler::describe_drift(&drift[0]).contains("AIU_DATA_DIR"));
+    }
+
+    #[test]
+    fn reinstalling_repairs_drift() {
+        let root = temp_root("repair");
+        let mut runner = RecordingRunner::default();
+        scheduler::install(Platform::Linux, &root, None, &spec_with_env(), &mut runner).unwrap();
+
+        let repaired = ScheduleSpec::new(PathBuf::from("/opt/aiu"))
+            .every_minutes(30)
+            .with_environment(vec![("AIU_DATA_DIR".to_string(), "/new".to_string())]);
+        scheduler::install(Platform::Linux, &root, None, &repaired, &mut runner).unwrap();
+
+        let read = scheduler::read_installed(Platform::Linux, &root, None).unwrap();
+        assert!(scheduler::drift(&read, &repaired).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_schedule_deactivates_and_deletes_the_units() {
+        for platform in [Platform::Linux, Platform::MacOs] {
+            let root = temp_root(&format!("remove-{platform:?}"));
+            let mut runner = RecordingRunner::default();
+            scheduler::install(platform, &root, None, &spec_with_env(), &mut runner).unwrap();
+            runner.calls.clear();
+
+            let removed = scheduler::uninstall(platform, &root, None, &mut runner).unwrap();
+
+            assert!(removed, "{platform:?} reports that it removed something");
+            assert!(!scheduler::is_installed(platform, &root, None));
+            assert!(
+                !runner.calls.is_empty(),
+                "{platform:?} asked the OS to deactivate it first: {:?}",
+                runner.calls
+            );
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn removing_a_schedule_that_was_never_installed_succeeds_quietly() {
+        let root = temp_root("remove-absent");
+        let mut runner = RecordingRunner::default();
+
+        let removed = scheduler::uninstall(Platform::Linux, &root, None, &mut runner).unwrap();
+
+        assert!(!removed, "nothing was there to remove");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

@@ -588,6 +588,20 @@ impl Store {
         Ok(rows)
     }
 
+    /// The device's last successful sync, or `None` when it has never synced.
+    pub fn device_last_sync(&self, device_id: &str) -> Result<Option<String>> {
+        let value = self.conn.query_row(
+            "SELECT last_sync_at_utc FROM devices WHERE device_id = ?1",
+            rusqlite::params![device_id],
+            |row| row.get::<_, Option<String>>(0),
+        );
+        match value {
+            Ok(value) => Ok(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn pending_sync_count(&self) -> Result<u64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM sync_outbox WHERE sent_at_utc IS NULL",

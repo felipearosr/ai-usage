@@ -48,6 +48,12 @@ pub enum Command {
     },
     Sync,
     Collect,
+    Status {
+        json: bool,
+    },
+    Schedule,
+    ScheduleInstall,
+    ScheduleRemove,
     Init,
     Join {
         code: String,
@@ -90,6 +96,11 @@ USAGE:
     aiu machine remove <device>     revoke a machine without deleting history
     aiu sync                        collect and synchronize now
     aiu collect                     run the scheduled collection pass once
+    aiu status [--json]             local diagnostics: scheduler, freshness,
+                                    queue, encryption, relay reachability
+    aiu schedule                    show the installed collection schedule
+    aiu schedule install            install or repair the schedule
+    aiu schedule remove             remove the schedule
     aiu init                        create a workspace and pairing code
     aiu join <code>                 join an existing workspace
 
@@ -142,6 +153,18 @@ where
         [] => Ok(Command::Report { json }),
         [command] if command == "sync" && !json => Ok(Command::Sync),
         [command] if command == "collect" && !json => Ok(Command::Collect),
+        [command] if command == "status" => Ok(Command::Status { json }),
+        [command] if command == "schedule" && !json => Ok(Command::Schedule),
+        [command, sub] if command == "schedule" && !json => match sub.as_str() {
+            "install" => Ok(Command::ScheduleInstall),
+            "remove" => Ok(Command::ScheduleRemove),
+            other => Err(ArgsError(format!(
+                "unknown schedule command: {other}\navailable: install, remove\n\n{USAGE}"
+            ))),
+        },
+        [command, ..] if command == "schedule" || command == "status" => Err(ArgsError(format!(
+            "invalid command\nusage: aiu status [--json] | aiu schedule [install|remove]\n\n{USAGE}"
+        ))),
         [command, ..] if command == "collect" => Err(ArgsError(format!(
             "invalid collect command\nusage: aiu collect\n\n{USAGE}"
         ))),
@@ -251,6 +274,30 @@ mod tests {
             "collect reports progress, not a JSON document"
         );
         assert!(parse(args(&["collect", "extra"])).is_err());
+    }
+
+    #[test]
+    fn status_and_schedule_commands_parse() {
+        assert_eq!(
+            parse(args(&["status"])).unwrap(),
+            Command::Status { json: false }
+        );
+        assert_eq!(
+            parse(args(&["status", "--json"])).unwrap(),
+            Command::Status { json: true }
+        );
+        assert_eq!(parse(args(&["schedule"])).unwrap(), Command::Schedule);
+        assert_eq!(
+            parse(args(&["schedule", "install"])).unwrap(),
+            Command::ScheduleInstall
+        );
+        assert_eq!(
+            parse(args(&["schedule", "remove"])).unwrap(),
+            Command::ScheduleRemove
+        );
+        assert!(parse(args(&["schedule", "frobnicate"])).is_err());
+        assert!(parse(args(&["schedule", "--json"])).is_err());
+        assert!(parse(args(&["status", "extra"])).is_err());
     }
 
     #[test]
