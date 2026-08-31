@@ -437,3 +437,93 @@ fn setup_reports_import_progress_per_detected_source() {
     assert_eq!(updates, vec![("claude", 1), ("codex", 3)]);
     std::fs::remove_dir_all(home).ok();
 }
+
+/// Setup installs automatic collection (issue 11): after `aiu init` or
+/// `aiu join`, the machine keeps collecting without anyone remembering to run
+/// anything.
+mod collection_schedule {
+    use aiu::scheduler::{self, CommandRunner, Platform};
+    use std::path::PathBuf;
+
+    #[derive(Default)]
+    struct RecordingRunner {
+        calls: Vec<String>,
+    }
+
+    impl CommandRunner for RecordingRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> std::io::Result<()> {
+            self.calls.push(format!("{program} {}", args.join(" ")));
+            Ok(())
+        }
+    }
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("aiu-setup-sched-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn setup_installs_a_scheduler_for_the_running_platform() {
+        let home = temp_home("install");
+        let mut runner = RecordingRunner::default();
+
+        let installed = aiu::setup::install_collection_schedule(&home, &mut runner);
+
+        match scheduler::current_platform() {
+            Some(platform) => {
+                let installed = installed.expect("a supported platform installs a scheduler");
+                assert_eq!(installed.platform, platform);
+                assert_eq!(
+                    installed.interval_minutes,
+                    scheduler::DEFAULT_INTERVAL_MINUTES
+                );
+                assert!(installed.activated);
+                assert!(
+                    installed.unit_paths.iter().all(|path| path.is_file()),
+                    "every unit was written: {:?}",
+                    installed.unit_paths
+                );
+                assert!(
+                    !runner.calls.is_empty(),
+                    "the OS was asked to activate the schedule"
+                );
+                let unit = std::fs::read_to_string(&installed.unit_paths[0]).unwrap();
+                assert!(
+                    unit.contains("collect"),
+                    "the unit invokes the collect pipeline: {unit}"
+                );
+            }
+            None => assert!(
+                installed.is_none(),
+                "an unsupported platform installs nothing rather than failing setup"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_setup_summary_reports_what_the_scheduler_is_doing() {
+        let installed = scheduler::Installation {
+            platform: Platform::Linux,
+            interval_minutes: 15,
+            unit_paths: Vec::new(),
+            activated: true,
+        };
+        let rendered = aiu::setup::describe_scheduler(Some(&installed));
+        assert!(rendered.contains("every 15 minutes"), "{rendered}");
+
+        let inactive = scheduler::Installation {
+            activated: false,
+            ..installed
+        };
+        assert!(
+            aiu::setup::describe_scheduler(Some(&inactive)).contains("not activated"),
+            "an un-activated schedule is stated plainly, not glossed over"
+        );
+        assert!(aiu::setup::describe_scheduler(None).contains("not installed"));
+    }
+}

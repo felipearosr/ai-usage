@@ -642,3 +642,114 @@ fn record_from_another_workspace_never_leaves_the_device() {
     assert!(relay.stored.is_empty());
     assert_eq!(store.pending_sync_count().unwrap(), 1);
 }
+
+/// A large queue must not be held in memory all at once (issue 11's 30 MB
+/// target). Uploads go out in bounded batches, and each batch is marked sent
+/// as the relay accepts it, so an interruption keeps the progress already made.
+#[test]
+fn a_large_outbox_uploads_in_bounded_batches() {
+    let store = Store::open_in_memory().unwrap();
+    device(&store, "device-a");
+    let queued = aiu::sync::UPLOAD_BATCH_SIZE * 2 + 7;
+    for index in 0..queued {
+        enqueue_record(
+            &store,
+            &SyncRecord::UsageEvent(Box::new(event(&format!("event-{index}"), "device-a"))),
+        )
+        .unwrap();
+    }
+
+    let mut relay = BatchCountingRelay::default();
+    let summary = sync_once(&store, &mut relay, &config("device-a")).unwrap();
+
+    assert!(
+        summary.uploaded >= queued,
+        "every queued record was uploaded"
+    );
+    assert!(
+        relay
+            .batch_sizes
+            .iter()
+            .all(|size| *size <= aiu::sync::UPLOAD_BATCH_SIZE),
+        "no batch exceeds the bound: {:?}",
+        relay.batch_sizes
+    );
+    assert!(
+        relay.batch_sizes.len() >= 3,
+        "the queue was split across batches: {:?}",
+        relay.batch_sizes
+    );
+    assert_eq!(
+        store.pending_sync_count().unwrap(),
+        0,
+        "outbox fully drained"
+    );
+}
+
+/// An upload that fails partway keeps the batches already accepted, so the
+/// retry re-sends only what is genuinely still queued.
+#[test]
+fn a_partial_upload_keeps_the_batches_the_relay_already_accepted() {
+    let store = Store::open_in_memory().unwrap();
+    device(&store, "device-a");
+    let queued = aiu::sync::UPLOAD_BATCH_SIZE + 5;
+    for index in 0..queued {
+        enqueue_record(
+            &store,
+            &SyncRecord::UsageEvent(Box::new(event(&format!("event-{index}"), "device-a"))),
+        )
+        .unwrap();
+    }
+
+    let mut relay = BatchCountingRelay {
+        fail_after_batches: Some(1),
+        ..BatchCountingRelay::default()
+    };
+    assert!(sync_once(&store, &mut relay, &config("device-a")).is_err());
+
+    assert_eq!(
+        store.pending_sync_count().unwrap() as usize,
+        queued - aiu::sync::UPLOAD_BATCH_SIZE,
+        "the accepted batch is not re-queued, the rest still is"
+    );
+}
+
+#[derive(Default)]
+struct BatchCountingRelay {
+    batch_sizes: Vec<usize>,
+    fail_after_batches: Option<usize>,
+}
+
+impl RelayClient for BatchCountingRelay {
+    fn upload(&mut self, _credential: &str, records: &[EncryptedRecord]) -> Result<(), RelayError> {
+        if let Some(limit) = self.fail_after_batches {
+            if self.batch_sizes.len() >= limit {
+                return Err(RelayError::Unavailable);
+            }
+        }
+        self.batch_sizes.push(records.len());
+        Ok(())
+    }
+
+    fn download(
+        &mut self,
+        _credential: &str,
+        _workspace_id: &str,
+        _after_cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<DownloadBatch, RelayError> {
+        Ok(DownloadBatch {
+            cursor: "0".to_string(),
+            records: Vec::new(),
+        })
+    }
+
+    fn revoke_device(
+        &mut self,
+        _credential: &str,
+        _workspace_id: &str,
+        _device_id: &str,
+    ) -> Result<(), RelayError> {
+        Ok(())
+    }
+}

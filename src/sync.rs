@@ -76,6 +76,10 @@ impl Drop for WorkspaceKey {
     }
 }
 
+/// How many outbox records are encrypted and uploaded at once. Bounds the
+/// memory a sync pass uses regardless of how deep the queue has grown.
+pub const UPLOAD_BATCH_SIZE: usize = 250;
+
 pub struct SyncConfig {
     pub workspace_id: String,
     pub device_id: String,
@@ -319,32 +323,49 @@ pub fn sync_once(
     Ok(summary)
 }
 
+/// Uploads the durable outbox in bounded batches.
+///
+/// The bound is what keeps a scheduled run inside its memory budget: a
+/// machine that was offline for days can have a very deep queue, and holding
+/// all of it — plaintext and ciphertext both — in memory at once is what
+/// pushed a 10k-record pass past the 30 MB RSS target. Each batch is marked
+/// sent as the relay accepts it, so an upload interrupted midway keeps the
+/// progress it already made and the retry re-sends only what is still queued.
 fn upload_pending(
     store: &crate::store::Store,
     relay: &mut dyn RelayClient,
     config: &SyncConfig,
 ) -> Result<usize> {
-    let pending = store.pending_sync_records()?;
-    let encrypted = pending
-        .iter()
-        .map(|item| {
-            let record: SyncRecord = serde_json::from_slice(&item.payload)?;
-            if !record.belongs_to(&config.workspace_id) {
-                return Err(SyncError::WorkspaceMismatch);
-            }
-            encrypt_record(&config.workspace_id, &config.key, &record)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if encrypted.is_empty() {
-        return Ok(0);
+    let mut uploaded = 0;
+    loop {
+        let pending = store.pending_sync_records(UPLOAD_BATCH_SIZE)?;
+        if pending.is_empty() {
+            return Ok(uploaded);
+        }
+        let encrypted = pending
+            .iter()
+            .map(|item| {
+                let record: SyncRecord = serde_json::from_slice(&item.payload)?;
+                if !record.belongs_to(&config.workspace_id) {
+                    return Err(SyncError::WorkspaceMismatch);
+                }
+                encrypt_record(&config.workspace_id, &config.key, &record)
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        relay.upload(&config.device_credential, &encrypted)?;
+
+        let ids = pending
+            .iter()
+            .map(|item| item.outbox_id)
+            .collect::<Vec<_>>();
+        store.mark_sync_records_sent(&ids)?;
+        uploaded += encrypted.len();
+
+        if pending.len() < UPLOAD_BATCH_SIZE {
+            return Ok(uploaded);
+        }
     }
-    relay.upload(&config.device_credential, &encrypted)?;
-    let ids = pending
-        .iter()
-        .map(|item| item.outbox_id)
-        .collect::<Vec<_>>();
-    store.mark_sync_records_sent(&ids)?;
-    Ok(encrypted.len())
 }
 
 fn apply_record(
