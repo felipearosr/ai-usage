@@ -139,8 +139,8 @@ fn run_collect() -> Result<(), Box<dyn std::error::Error>> {
                 config = Some(loaded);
                 relay = Some(client);
             }
-            (Err(error), _) => eprintln!("aiu: sync unavailable; collecting locally: {error}"),
-            (_, Err(error)) => eprintln!("aiu: sync unavailable; collecting locally: {error}"),
+            (Err(error), _) => report_sync_unavailable(&error),
+            (_, Err(error)) => report_sync_unavailable(&error),
         }
     }
 
@@ -154,6 +154,10 @@ fn run_collect() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     print!("{}", aiu::pipeline::render(&run));
     Ok(())
+}
+
+fn report_sync_unavailable(error: &dyn std::fmt::Display) {
+    eprintln!("aiu: sync unavailable; collecting locally: {error}");
 }
 
 fn run_machine_rename(device: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -215,7 +219,7 @@ fn run_init() -> Result<(), Box<dyn std::error::Error>> {
         &mut print_import_progress,
     )?;
     let mut outcome = outcome;
-    outcome.scheduler = install_schedule(&home);
+    outcome.scheduler = aiu::scheduler::install_default(&home, &mut aiu::scheduler::ProcessRunner);
     print!("{}", aiu::setup::render_init(&outcome));
     println!("Workspace setup is complete. Waiting for the joining machine...");
     println!("Press Ctrl-C if you are not pairing now; run `aiu init` later for a fresh code.");
@@ -263,18 +267,10 @@ fn run_join(code: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let mut outcome = outcome;
-    outcome.scheduler = install_schedule(&home);
+    outcome.scheduler = aiu::scheduler::install_default(&home, &mut aiu::scheduler::ProcessRunner);
     print!("{}", aiu::setup::render_join(&outcome));
     sync_after_setup(&store, &mut relay);
     Ok(())
-}
-
-/// Installs the collection schedule as the last step of setup. A machine that
-/// cannot activate one (no user session, unsupported OS) is still fully set
-/// up — the report says so, and `aiu collect` remains available by hand.
-fn install_schedule(home: &std::path::Path) -> Option<aiu::scheduler::Installation> {
-    let mut runner = aiu::scheduler::ProcessRunner;
-    aiu::setup::install_collection_schedule(home, &mut runner)
 }
 
 fn print_import_progress(progress: aiu::collect::CollectProgress) {

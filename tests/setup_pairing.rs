@@ -470,7 +470,7 @@ mod collection_schedule {
         let home = temp_home("install");
         let mut runner = RecordingRunner::default();
 
-        let installed = aiu::setup::install_collection_schedule(&home, &mut runner);
+        let installed = scheduler::install_default(&home, &mut runner);
 
         match scheduler::current_platform() {
             Some(platform) => {
@@ -513,7 +513,7 @@ mod collection_schedule {
             unit_paths: Vec::new(),
             activated: true,
         };
-        let rendered = aiu::setup::describe_scheduler(Some(&installed));
+        let rendered = scheduler::describe(Some(&installed));
         assert!(rendered.contains("every 15 minutes"), "{rendered}");
 
         let inactive = scheduler::Installation {
@@ -521,9 +521,9 @@ mod collection_schedule {
             ..installed
         };
         assert!(
-            aiu::setup::describe_scheduler(Some(&inactive)).contains("not activated"),
+            scheduler::describe(Some(&inactive)).contains("not activated"),
             "an un-activated schedule is stated plainly, not glossed over"
         );
-        assert!(aiu::setup::describe_scheduler(None).contains("not installed"));
+        assert!(scheduler::describe(None).contains("not installed"));
     }
 }

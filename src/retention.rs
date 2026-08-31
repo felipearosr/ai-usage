@@ -48,6 +48,13 @@ pub fn cutoff(now_epoch: u64) -> String {
 /// Deletes every row older than the retention horizon across usage events,
 /// quota snapshots, and sync metadata.
 ///
+/// Two tables are deliberately exempt. `sync_cursors` holds a single row
+/// recording how far the relay download has progressed, and `adapter_state`
+/// holds one row per adapter; neither grows with time, and pruning either by
+/// age would be actively harmful — dropping the cursor forces a full
+/// re-download of the workspace. The spec's "statistics" and "windows"
+/// record types have no tables yet; when they arrive they belong here.
+///
 /// Outbox rows are pruned by age regardless of delivery state: a row older
 /// than the horizon describes an event that is itself being pruned in the
 /// same pass, so keeping it would queue data the workspace no longer retains.

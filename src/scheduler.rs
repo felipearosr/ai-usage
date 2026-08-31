@@ -55,6 +55,14 @@ impl Platform {
 pub struct ScheduleSpec {
     pub exe: PathBuf,
     pub interval_minutes: u64,
+    /// Environment the scheduled run needs, captured at install time.
+    ///
+    /// A scheduled run inherits none of the shell environment the user set up
+    /// interactively, so anything the run depends on — the relay URL, the
+    /// data directory — has to be written into the unit. Without this a
+    /// machine paired against a non-default relay would collect happily and
+    /// queue to a relay that never receives it.
+    pub environment: Vec<(String, String)>,
 }
 
 impl ScheduleSpec {
@@ -62,7 +70,14 @@ impl ScheduleSpec {
         Self {
             exe,
             interval_minutes: DEFAULT_INTERVAL_MINUTES,
+            environment: Vec::new(),
         }
+    }
+
+    /// Captures environment variables into the unit.
+    pub fn with_environment(mut self, environment: Vec<(String, String)>) -> Self {
+        self.environment = environment;
+        self
     }
 
     /// Overrides the interval. Zero would mean "run continuously", which is
@@ -123,19 +138,15 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-/// Where this platform's unit files live under `home`.
-pub fn unit_paths(platform: Platform, home: &Path) -> Vec<PathBuf> {
-    unit_paths_with_config(platform, home, xdg_from_env().as_deref())
-}
-
 fn xdg_from_env() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
-/// [`unit_paths`] with `XDG_CONFIG_HOME` supplied explicitly, so the override
-/// is testable without mutating process-wide environment.
+/// Where this platform's unit files live, with `XDG_CONFIG_HOME` supplied
+/// explicitly so the override is resolvable without reading process-wide
+/// environment.
 pub fn unit_paths_with_config(
     platform: Platform,
     home: &Path,
@@ -157,6 +168,11 @@ pub fn unit_paths_with_config(
 
 /// The systemd unit that performs one collection and exits.
 pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
+    let environment: String = spec
+        .environment
+        .iter()
+        .map(|(key, value)| format!("Environment=\"{key}={}\"\n", escape_systemd(value)))
+        .collect();
     format!(
         "[Unit]\n\
          Description=aiu — collect AI coding usage\n\
@@ -164,9 +180,24 @@ pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
          \n\
          [Service]\n\
          Type=oneshot\n\
+         {environment}\
          ExecStart={} collect\n",
         spec.exe.display()
     )
+}
+
+/// Escapes a value for a double-quoted systemd `Environment=` assignment.
+fn escape_systemd(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Escapes text for an XML character-data position in the plist.
+fn escape_xml(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// The timer that starts the service on the scheduled interval.
@@ -176,8 +207,7 @@ pub fn render_systemd_timer(spec: &ScheduleSpec) -> String {
          Description=aiu — collect AI coding usage every {minutes} minutes\n\
          \n\
          [Timer]\n\
-         OnBootSec={minutes}min\n\
-         OnUnitActiveSec={minutes}min\n\
+         OnCalendar=*:0/{minutes}\n\
          AccuracySec=1min\n\
          Persistent=true\n\
          Unit={service}\n\
@@ -192,6 +222,22 @@ pub fn render_systemd_timer(spec: &ScheduleSpec) -> String {
 /// The launchd agent. `StartInterval` re-runs a program that has exited, so
 /// there is no `KeepAlive` and nothing stays resident.
 pub fn render_launchd_plist(spec: &ScheduleSpec) -> String {
+    let environment = if spec.environment.is_empty() {
+        String::new()
+    } else {
+        let entries: String = spec
+            .environment
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "        <key>{}</key>\n        <string>{}</string>\n",
+                    escape_xml(key),
+                    escape_xml(value)
+                )
+            })
+            .collect();
+        format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}    </dict>\n")
+    };
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
@@ -209,6 +255,7 @@ pub fn render_launchd_plist(spec: &ScheduleSpec) -> String {
              <integer>{seconds}</integer>\n    \
              <key>RunAtLoad</key>\n    \
              <false/>\n\
+         {environment}\
          </dict>\n\
          </plist>\n",
         label = LAUNCHD_LABEL,
@@ -292,61 +339,47 @@ fn activate(
     }
 }
 
-/// Whether this platform's units are present on disk under `home`.
-pub fn is_installed(platform: Platform, home: &Path) -> bool {
-    is_installed_with_config(platform, home, xdg_from_env().as_deref())
+/// Installs the default collection schedule for the running platform,
+/// invoking the currently running binary.
+///
+/// Returns `None` on an OS with no supported scheduler, or when the running
+/// binary's own path cannot be resolved — neither is a reason to fail a setup
+/// that otherwise succeeded, since `aiu collect` still works by hand.
+pub fn install_default(home: &Path, runner: &mut dyn CommandRunner) -> Option<Installation> {
+    let platform = current_platform()?;
+    let exe = std::env::current_exe().ok()?;
+    let spec = ScheduleSpec::new(exe).with_environment(inherited_environment());
+    install(platform, home, &spec, runner).ok()
 }
 
-/// [`is_installed`] with `XDG_CONFIG_HOME` supplied explicitly.
-pub fn is_installed_with_config(
-    platform: Platform,
-    home: &Path,
-    xdg_config_home: Option<&Path>,
-) -> bool {
-    let paths = unit_paths_with_config(platform, home, xdg_config_home);
-    !paths.is_empty() && paths.iter().all(|path| path.is_file())
+/// The environment variables a scheduled run must keep. Only variables the
+/// user actually set are captured; defaults stay defaults.
+fn inherited_environment() -> Vec<(String, String)> {
+    ["AIU_RELAY_URL", "AIU_DATA_DIR"]
+        .iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
 }
 
-/// Deactivates and removes the units. Missing files are not an error, so this
-/// is safe to call on a machine that never installed a scheduler.
-pub fn uninstall(
-    platform: Platform,
-    home: &Path,
-    runner: &mut dyn CommandRunner,
-) -> io::Result<()> {
-    uninstall_with_config(platform, home, xdg_from_env().as_deref(), runner)
-}
-
-/// [`uninstall`] with `XDG_CONFIG_HOME` supplied explicitly.
-pub fn uninstall_with_config(
-    platform: Platform,
-    home: &Path,
-    xdg_config_home: Option<&Path>,
-    runner: &mut dyn CommandRunner,
-) -> io::Result<()> {
-    let paths = unit_paths_with_config(platform, home, xdg_config_home);
-    match platform {
-        Platform::Linux => {
-            let _ = runner.run(
-                "systemctl",
-                &args(&["--user", "disable", "--now", SYSTEMD_TIMER]),
-            );
-        }
-        Platform::MacOs => {
-            let _ = runner.run(
-                "launchctl",
-                &args(&["unload", &paths[0].display().to_string()]),
-            );
-        }
+/// One line describing what automatic collection is doing now.
+pub fn describe(installation: Option<&Installation>) -> String {
+    match installation {
+        Some(install) if install.activated => format!(
+            "{} runs `aiu collect` every {} minutes",
+            install.platform.as_str(),
+            install.interval_minutes
+        ),
+        Some(install) => format!(
+            "{} written but not activated; run `aiu collect` by hand or activate it at next login",
+            install.platform.as_str()
+        ),
+        None => "automatic collection is not installed; run `aiu collect` manually".to_string(),
     }
-    for path in &paths {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

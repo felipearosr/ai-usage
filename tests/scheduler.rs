@@ -64,12 +64,17 @@ fn systemd_units_run_collect_on_a_fifteen_minute_timer() {
         "a oneshot unit starts, works, and exits — no resident daemon: {service}"
     );
     assert!(
-        timer.contains("OnUnitActiveSec=15min"),
+        timer.contains("OnCalendar=*:0/15"),
         "repeats every 15 minutes: {timer}"
     );
     assert!(
         timer.contains("Persistent=true"),
         "a missed run while the machine was off is caught up: {timer}"
+    );
+    assert!(
+        !timer.contains("OnUnitActiveSec"),
+        "systemd honours Persistent= only on calendar timers, so the schedule \
+         must be expressed as one rather than as a monotonic interval: {timer}"
     );
     assert!(timer.contains("WantedBy=timers.target"));
 }
@@ -98,7 +103,7 @@ fn launchd_agent_runs_collect_every_nine_hundred_seconds() {
 #[test]
 fn a_custom_interval_reaches_both_platforms() {
     let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).every_minutes(30);
-    assert!(scheduler::render_systemd_timer(&spec).contains("OnUnitActiveSec=30min"));
+    assert!(scheduler::render_systemd_timer(&spec).contains("OnCalendar=*:0/30"));
     assert!(scheduler::render_launchd_plist(&spec).contains("<integer>1800</integer>"));
 }
 
@@ -181,14 +186,10 @@ fn reinstalling_is_idempotent_and_rewrites_the_units() {
 
     let service = read(&root.join(".config/systemd/user/aiu-collect.service"));
     assert!(service.contains("ExecStart=/opt/aiu collect"), "{service}");
-    assert!(read(&root.join(".config/systemd/user/aiu-collect.timer"))
-        .contains("OnUnitActiveSec=20min"));
+    assert!(
+        read(&root.join(".config/systemd/user/aiu-collect.timer")).contains("OnCalendar=*:0/20")
+    );
     assert_eq!(second.interval_minutes, 20);
-    assert!(scheduler::is_installed_with_config(
-        Platform::Linux,
-        &root,
-        None
-    ));
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -206,51 +207,9 @@ fn a_failed_activation_still_leaves_the_units_on_disk() {
         scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
 
     assert!(!installed.activated, "activation failure is reported");
-    assert!(root
-        .join(".config/systemd/user/aiu-collect.timer")
-        .is_file());
-    assert!(scheduler::is_installed_with_config(
-        Platform::Linux,
-        &root,
-        None
-    ));
-
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn is_installed_is_false_before_install_and_after_uninstall() {
-    let root = temp_root("uninstall");
-    let mut runner = RecordingRunner::default();
-
-    assert!(!scheduler::is_installed_with_config(
-        Platform::Linux,
-        &root,
-        None
-    ));
-    assert!(!scheduler::is_installed_with_config(
-        Platform::MacOs,
-        &root,
-        None
-    ));
-
-    scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
-    assert!(scheduler::is_installed_with_config(
-        Platform::Linux,
-        &root,
-        None
-    ));
-
-    scheduler::uninstall_with_config(Platform::Linux, &root, None, &mut runner).unwrap();
-    assert!(!scheduler::is_installed_with_config(
-        Platform::Linux,
-        &root,
-        None
-    ));
     assert!(
-        runner.calls.iter().any(|c| c.contains("disable")),
-        "the timer is disabled, not just unlinked: {:?}",
-        runner.calls
+        installed.unit_paths.iter().all(|path| path.is_file()),
+        "the units survive a failed activation and can be activated by hand"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -299,4 +258,67 @@ fn dump_units_for_inspection() {
     let mut runner = RecordingRunner::default();
     scheduler::install_with_config(Platform::Linux, &root, None, &spec(), &mut runner).unwrap();
     scheduler::install_with_config(Platform::MacOs, &root, None, &spec(), &mut runner).unwrap();
+}
+
+/// A machine paired against a non-default relay, or using a non-default data
+/// directory, must keep using them on every scheduled run. The scheduler runs
+/// with none of the shell environment the user set up interactively, so
+/// whatever the run depends on has to be captured into the unit at install
+/// time — otherwise scheduled runs silently read a different database, or
+/// queue records to a relay that never receives them.
+#[test]
+fn the_environment_a_run_depends_on_is_captured_into_the_units() {
+    let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).with_environment(vec![
+        (
+            "AIU_RELAY_URL".to_string(),
+            "https://relay.example".to_string(),
+        ),
+        ("AIU_DATA_DIR".to_string(), "/srv/aiu".to_string()),
+    ]);
+
+    let service = scheduler::render_systemd_service(&spec);
+    assert!(
+        service.contains("Environment=\"AIU_RELAY_URL=https://relay.example\""),
+        "{service}"
+    );
+    assert!(
+        service.contains("Environment=\"AIU_DATA_DIR=/srv/aiu\""),
+        "{service}"
+    );
+
+    let plist = scheduler::render_launchd_plist(&spec);
+    assert!(plist.contains("<key>EnvironmentVariables</key>"), "{plist}");
+    assert!(plist.contains("<key>AIU_RELAY_URL</key>"), "{plist}");
+    assert!(
+        plist.contains("<string>https://relay.example</string>"),
+        "{plist}"
+    );
+}
+
+#[test]
+fn units_carry_no_environment_block_when_there_is_nothing_to_capture() {
+    let service = scheduler::render_systemd_service(&spec());
+    let plist = scheduler::render_launchd_plist(&spec());
+    assert!(!service.contains("Environment="), "{service}");
+    assert!(!plist.contains("EnvironmentVariables"), "{plist}");
+}
+
+#[test]
+fn captured_environment_values_are_escaped_for_their_format() {
+    let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).with_environment(vec![(
+        "AIU_RELAY_URL".to_string(),
+        "https://host/a&b\"q\"".to_string(),
+    )]);
+
+    let plist = scheduler::render_launchd_plist(&spec);
+    assert!(
+        plist.contains("https://host/a&amp;b&quot;q&quot;"),
+        "XML metacharacters must not break the plist: {plist}"
+    );
+
+    let service = scheduler::render_systemd_service(&spec);
+    assert!(
+        !service.contains("a&b\"q\""),
+        "the quoted systemd value escapes its own quotes: {service}"
+    );
 }
