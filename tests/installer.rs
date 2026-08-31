@@ -214,8 +214,7 @@ fn installs_the_artifact_matching_the_detected_platform() {
 #[test]
 fn installing_leaves_no_staging_file_behind() {
     // The binary is staged inside the install directory so the final step is
-    // an atomic rename; that staging file must not survive the install, and
-    // must not survive a failed one either.
+    // an atomic rename; that staging file must not survive the install.
     let sandbox = Sandbox::new("staging");
     let release = sandbox.publish("1.2.3");
     assert!(sandbox.install(Some(("Linux", "x86_64")), &[]).ok);
@@ -228,6 +227,42 @@ fn installing_leaves_no_staging_file_behind() {
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(entries, vec!["aiu".to_string()], "left behind: {entries:?}");
+}
+
+#[test]
+fn a_destination_that_is_not_a_regular_file_is_refused() {
+    // Regression test. `mv file dir` moves the file *into* dir rather than
+    // replacing it, so before this was guarded the installer reported a
+    // successful install, left the staged file sitting inside the directory,
+    // and installed nothing runnable. Refusing up front is both the correct
+    // outcome and the reason no staging file can be stranded here.
+    let sandbox = Sandbox::new("staged-cleanup");
+    sandbox.publish("1.2.3");
+    let bin = sandbox.path("home/.local/bin");
+    fs::create_dir_all(bin.join("aiu")).unwrap();
+    fs::write(bin.join("aiu/occupied"), b"in the way").unwrap();
+
+    let out = sandbox.install(Some(("Linux", "x86_64")), &[]);
+    assert!(
+        !out.ok,
+        "a destination that cannot be replaced must fail, not report success: {}",
+        out.all()
+    );
+    assert!(
+        !out.all().contains("installed /"),
+        "refusing must not also claim an install happened: {}",
+        out.all()
+    );
+
+    let stray: Vec<String> = fs::read_dir(&bin)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".aiu.install"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "a failed install must not strand its staging file: {stray:?}"
+    );
 }
 
 #[test]

@@ -133,6 +133,12 @@ main() {
   chmod +x "$tmp/aiu"
 
   mkdir -p "$INSTALL_DIR"
+  # `mv file dir` moves the file *into* dir rather than replacing it, so a
+  # destination that is somehow a directory would report a successful install
+  # having installed nothing runnable.
+  if [ -e "$INSTALL_DIR/aiu" ] && [ ! -f "$INSTALL_DIR/aiu" ]; then
+    die "$INSTALL_DIR/aiu exists and is not a regular file; move it aside and re-run"
+  fi
   # Stage inside the destination directory, then rename. A rename within one
   # filesystem is atomic, so the collection schedule firing mid-install sees
   # either the old binary or the new one and never a half-written file —

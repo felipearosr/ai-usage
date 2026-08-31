@@ -202,6 +202,38 @@ fn seeded_usage_reaches_every_report_that_should_show_it() {
         );
     }
 
+    // The compact report's own text rendering, not just its JSON: the two
+    // renderers are separate code paths and only one of them is what a user
+    // actually sees.
+    let compact = cli.ok(&[]);
+    assert!(
+        compact.contains("42"),
+        "the compact text report should show the recorded quota:\n{compact}"
+    );
+
+    // Each per-source detail view carries that source's quota and exact model.
+    for source in SOURCES {
+        let detail = cli.ok(&[source]);
+        assert!(
+            detail.contains(&format!("{source}-exact-model-2026")),
+            "`aiu {source}` should name the exact model:\n{detail}"
+        );
+        // The detail view keeps vendor-reported quota and locally attributed
+        // usage in separate branches — the spec's correctness hierarchy — so
+        // both are checked rather than assuming one stands for the other.
+        let detail_json = as_json(&cli.ok(&[source, "--json"]));
+        let window = &detail_json["windows"][0];
+        assert_eq!(
+            window["vendor"]["used_percent"], 42.0,
+            "`aiu {source} --json` should carry the vendor quota: {detail_json}"
+        );
+        assert_eq!(
+            window["attribution"]["models"][0]["name"],
+            format!("{source}-exact-model-2026"),
+            "`aiu {source} --json` should attribute usage to the exact model: {detail_json}"
+        );
+    }
+
     // The machine's friendly name reaches the fleet view and the per-source
     // machine breakdowns; the exact model reaches the model matrix.
     assert!(cli.ok(&["machines"]).contains("seeded-machine"));

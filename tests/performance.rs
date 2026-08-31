@@ -34,6 +34,13 @@ const MODELS: [&str; 3] = ["a", "b", "c"];
 const DAYS: u64 = 365;
 const EVENTS_PER_DAY_PER_DEVICE: usize = 8;
 
+/// A string only the fixture can produce. `machine 0` is the top machine for
+/// every source, so it appears in the fleet view, the compact overview and
+/// every per-source view. `aiu status` reports diagnostics rather than usage
+/// and so has a witness of its own.
+const USAGE_WITNESS: &str = "machine 0";
+const STATUS_WITNESS: &str = "Pending records";
+
 /// `cargo test --release` builds the binary users actually run, so it holds
 /// the spec's 100 ms target directly. An unoptimized build compiles SQLite's
 /// bundled C without optimization and inlines nothing, so a debug run is
@@ -123,7 +130,7 @@ fn populate(store: &Store) {
 /// Runs a command a few times and returns the fastest, so an unlucky
 /// scheduler slice on a shared CI box does not decide whether the query path
 /// regressed.
-fn best_of(root: &std::path::Path, args: &[&str]) -> Duration {
+fn best_of(root: &std::path::Path, args: &[&str], witness: &str) -> Duration {
     (0..5)
         .map(|_| {
             let start = Instant::now();
@@ -142,9 +149,15 @@ fn best_of(root: &std::path::Path, args: &[&str]) -> Duration {
                 args.join(" "),
                 String::from_utf8_lossy(&out.stderr)
             );
+            // A timing over an empty report would be fast and meaningless, so
+            // every measured command has to prove it saw the fixture: if the
+            // AIU_DATA_DIR seam ever broke, each run would render the
+            // empty-install report and sail under the budget.
+            let stdout = String::from_utf8_lossy(&out.stdout);
             assert!(
-                !out.stdout.is_empty(),
-                "`aiu {}` rendered nothing, so its timing means nothing",
+                stdout.contains(witness),
+                "`aiu {}` did not render the fixture data, so its timing means \
+                 nothing:\n{stdout}",
                 args.join(" ")
             );
             elapsed
@@ -162,19 +175,23 @@ fn every_local_report_renders_within_the_latency_budget() {
     }
 
     // Every report command in the spec's §100 surface that renders locally.
-    let mut commands: Vec<Vec<&str>> = vec![vec![], vec!["machines"], vec!["status"]];
+    let mut commands: Vec<(Vec<&str>, &str)> = vec![
+        (vec![], USAGE_WITNESS),
+        (vec!["machines"], USAGE_WITNESS),
+        (vec!["status"], STATUS_WITNESS),
+    ];
     for source in SOURCES {
-        commands.push(vec![source]);
-        commands.push(vec![source, "models"]);
-        commands.push(vec![source, "machines"]);
+        commands.push((vec![source], USAGE_WITNESS));
+        commands.push((vec![source, "models"], USAGE_WITNESS));
+        commands.push((vec![source, "machines"], USAGE_WITNESS));
     }
 
     let measured: Vec<(String, Duration)> = commands
         .iter()
-        .map(|args| {
+        .map(|(args, witness)| {
             (
                 format!("aiu {}", args.join(" ")).trim_end().to_string(),
-                best_of(&root, args),
+                best_of(&root, args, witness),
             )
         })
         .collect();

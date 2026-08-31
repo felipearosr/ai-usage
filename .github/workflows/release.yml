@@ -27,6 +27,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt -- --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
@@ -57,6 +58,23 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      # Checked before the build, so a mistyped tag fails in seconds rather
+      # than after four matrix builds.
+      - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          # The tag must be exactly v<version>. Stripping an optional prefix
+          # instead would accept a bare "0.1.0", publish a release named for
+          # it, and leave install.sh asking for download/v0.1.0 — a 404 for
+          # every user.
+          [ "$TAG" = "v$declared" ] \
+            || { echo "tag $TAG must be v$declared (crate version)" >&2; exit 1; }
+          echo "AIU_VERSION=$declared" >> "$GITHUB_ENV"
+
       - name: Install musl toolchain
         if: endsWith(matrix.target, '-musl')
         run: |
@@ -67,20 +85,6 @@ jobs:
 
       # The archive holds a bare `aiu` at its root: the installer unpacks it
       # into a temporary directory and expects exactly that name.
-      # The tag names the version; Cargo.toml must agree, or the artifacts
-      # would be named for a version that release cannot be resolved from.
-      # Both jobs derive it this one way, so they cannot disagree.
-      - name: Resolve version
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
-        run: |
-          set -eu
-          version="${TAG#v}"
-          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          [ "$version" = "$declared" ] \
-            || { echo "tag $TAG does not match crate version $declared" >&2; exit 1; }
-          echo "AIU_VERSION=$version" >> "$GITHUB_ENV"
-
       - name: Package
         run: |
           set -eu
@@ -112,11 +116,14 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -eu
-          version="${TAG#v}"
           declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          [ "$version" = "$declared" ] \
-            || { echo "tag $TAG does not match crate version $declared" >&2; exit 1; }
-          echo "AIU_VERSION=$version" >> "$GITHUB_ENV"
+          # The tag must be exactly v<version>. Stripping an optional prefix
+          # instead would accept a bare "0.1.0", publish a release named for
+          # it, and leave install.sh asking for download/v0.1.0 — a 404 for
+          # every user.
+          [ "$TAG" = "v$declared" ] \
+            || { echo "tag $TAG must be v$declared (crate version)" >&2; exit 1; }
+          echo "AIU_VERSION=$declared" >> "$GITHUB_ENV"
 
       # Checksums are what the installer verifies against, so they are
       # computed here over the exact bytes being uploaded.
