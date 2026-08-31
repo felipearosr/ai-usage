@@ -56,7 +56,7 @@ fn systemd_units_run_collect_on_a_fifteen_minute_timer() {
     let timer = scheduler::render_systemd_timer(&spec());
 
     assert!(
-        service.contains("ExecStart=/usr/local/bin/aiu collect"),
+        service.contains(r#"ExecStart="/usr/local/bin/aiu" collect"#),
         "service invokes the collect pipeline: {service}"
     );
     assert!(
@@ -148,7 +148,7 @@ fn installing_on_linux_writes_user_units_and_enables_the_timer() {
     let unit_dir = root.join(".config/systemd/user");
     assert!(unit_dir.join("aiu-collect.service").is_file());
     assert!(unit_dir.join("aiu-collect.timer").is_file());
-    assert!(read(&unit_dir.join("aiu-collect.service")).contains("aiu collect"));
+    assert!(read(&unit_dir.join("aiu-collect.service")).contains(r#""/usr/local/bin/aiu" collect"#));
     assert_eq!(
         installed,
         Installation {
@@ -209,7 +209,10 @@ fn reinstalling_is_idempotent_and_rewrites_the_units() {
             .unwrap();
 
     let service = read(&root.join(".config/systemd/user/aiu-collect.service"));
-    assert!(service.contains("ExecStart=/opt/aiu collect"), "{service}");
+    assert!(
+        service.contains(r#"ExecStart="/opt/aiu" collect"#),
+        "{service}"
+    );
     assert!(
         read(&root.join(".config/systemd/user/aiu-collect.timer")).contains("OnCalendar=*:0/20")
     );
@@ -380,4 +383,82 @@ fn a_captured_value_containing_a_control_character_is_refused() {
     assert!(!scheduler::is_capturable("https://host\nExecStart=/bin/sh"));
     assert!(!scheduler::is_capturable("https://host\u{0}x"));
     assert!(!scheduler::is_capturable(""));
+}
+
+/// systemd expands `%` specifiers in `ExecStart` too, and an unresolvable one
+/// is fatal to the whole unit ("Unit configuration has fatal error, unit will
+/// not be started") rather than costing a single variable. An unquoted space
+/// is just as bad in a quieter way: systemd splits the command on whitespace,
+/// so `/opt/with space/aiu` resolves to `/opt/with`. The exe path comes from
+/// `current_exe()`, so both are reachable from an ordinary home directory.
+#[test]
+fn the_executable_path_is_quoted_and_escaped_in_the_systemd_unit() {
+    let spec = ScheduleSpec::new(PathBuf::from("/opt/a%20b/with space/aiu"));
+    let service = scheduler::render_systemd_service(&spec);
+
+    assert!(
+        service.contains(r#"ExecStart="/opt/a%%20b/with space/aiu" collect"#),
+        "the path is quoted as one argument and its percent doubled: {service}"
+    );
+}
+
+/// The same path in the plist sits in an XML character-data position, so a
+/// path containing an XML metacharacter must be escaped for that format
+/// instead.
+#[test]
+fn the_executable_path_is_xml_escaped_in_the_launchd_plist() {
+    let spec = ScheduleSpec::new(PathBuf::from("/opt/a&b/aiu"));
+    let plist = scheduler::render_launchd_plist(&spec);
+
+    assert!(
+        plist.contains("<string>/opt/a&amp;b/aiu</string>"),
+        "{plist}"
+    );
+    assert!(
+        !plist.contains("<string>/opt/a&b/aiu</string>"),
+        "a raw ampersand would make the plist unparsable: {plist}"
+    );
+}
+
+/// The escaping order matters when a value carries both a backslash and a
+/// percent: doubling backslashes must not go on to double the percent's, and
+/// the percent pass must not disturb the backslash escapes.
+#[test]
+fn a_value_carrying_both_a_backslash_and_a_percent_escapes_once_each() {
+    let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu"))
+        .with_environment(vec![("AIU_DATA_DIR".to_string(), r"a\b100%".to_string())]);
+
+    let service = scheduler::render_systemd_service(&spec);
+    assert!(
+        service.contains(r#"Environment="AIU_DATA_DIR=a\\b100%%""#),
+        "{service}"
+    );
+}
+
+/// The capture filter is a courtesy at one call site; the render seam is
+/// where an injected directive would actually land, so it refuses such a
+/// value too rather than trusting every caller of `with_environment`.
+#[test]
+fn a_control_carrying_value_never_reaches_a_rendered_unit() {
+    let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).with_environment(vec![
+        (
+            "AIU_RELAY_URL".to_string(),
+            "https://host\nExecStart=/bin/sh".to_string(),
+        ),
+        ("AIU_DATA_DIR".to_string(), "/srv/aiu".to_string()),
+    ]);
+
+    let service = scheduler::render_systemd_service(&spec);
+    assert!(
+        !service.contains("/bin/sh"),
+        "the injected directive is dropped, not escaped: {service}"
+    );
+    assert!(
+        service.contains(r#"Environment="AIU_DATA_DIR=/srv/aiu""#),
+        "the well-formed variable beside it still survives: {service}"
+    );
+
+    let plist = scheduler::render_launchd_plist(&spec);
+    assert!(!plist.contains("/bin/sh"), "{plist}");
+    assert!(plist.contains("<key>AIU_DATA_DIR</key>"), "{plist}");
 }

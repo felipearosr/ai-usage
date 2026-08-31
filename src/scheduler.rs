@@ -111,7 +111,9 @@ fn schedulable(minutes: u64) -> bool {
     minutes > 0 && minutes < 60 && 60 % minutes == 0
 }
 
-/// Whether a value can be safely written into a unit file.
+/// Whether a value can be safely written into a unit file. Applied both when
+/// capturing from the environment and again at each render seam, since that
+/// is where an injected directive would actually land.
 ///
 /// A newline would close the quoted `Environment=` assignment and let the
 /// rest of the value inject directives into the unit; other control
@@ -193,6 +195,7 @@ pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
     let environment: String = spec
         .environment
         .iter()
+        .filter(|(_, value)| is_capturable(value))
         .map(|(key, value)| format!("Environment=\"{key}={}\"\n", escape_systemd(value)))
         .collect();
     format!(
@@ -203,8 +206,8 @@ pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
          [Service]\n\
          Type=oneshot\n\
          {environment}\
-         ExecStart={} collect\n",
-        spec.exe.display()
+         ExecStart=\"{}\" collect\n",
+        escape_systemd(&spec.exe.display().to_string())
     )
 }
 
@@ -250,12 +253,13 @@ pub fn render_systemd_timer(spec: &ScheduleSpec) -> String {
 /// The launchd agent. `StartInterval` re-runs a program that has exited, so
 /// there is no `KeepAlive` and nothing stays resident.
 pub fn render_launchd_plist(spec: &ScheduleSpec) -> String {
-    let environment = if spec.environment.is_empty() {
+    let environment = if !spec.environment.iter().any(|(_, v)| is_capturable(v)) {
         String::new()
     } else {
         let entries: String = spec
             .environment
             .iter()
+            .filter(|(_, value)| is_capturable(value))
             .map(|(key, value)| {
                 format!(
                     "        <key>{}</key>\n        <string>{}</string>\n",
@@ -287,7 +291,7 @@ pub fn render_launchd_plist(spec: &ScheduleSpec) -> String {
          </dict>\n\
          </plist>\n",
         label = LAUNCHD_LABEL,
-        exe = spec.exe.display(),
+        exe = escape_xml(&spec.exe.display().to_string()),
         seconds = spec.interval_seconds(),
     )
 }
