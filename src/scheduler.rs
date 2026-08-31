@@ -80,13 +80,22 @@ impl ScheduleSpec {
         self
     }
 
-    /// Overrides the interval. Zero would mean "run continuously", which is
-    /// the daemon the spec rules out, so it falls back to the default.
+    /// Overrides the interval, falling back to the default for any value that
+    /// cannot be scheduled truthfully.
+    ///
+    /// Zero would mean "run continuously", which is the daemon the spec rules
+    /// out. Anything that does not divide an hour is rejected for a subtler
+    /// reason: the systemd schedule is a calendar expression, and
+    /// `OnCalendar=*:0/60` is not a valid minute specification at all — the
+    /// timer would fail to load and collection would stop silently. A
+    /// non-divisor such as 7 loads but leaves a short gap at the top of each
+    /// hour, so it is not "every 7 minutes" either, and would not match
+    /// launchd's elapsed-time `StartInterval` on the other platform.
     pub fn every_minutes(mut self, minutes: u64) -> Self {
-        self.interval_minutes = if minutes == 0 {
-            DEFAULT_INTERVAL_MINUTES
-        } else {
+        self.interval_minutes = if schedulable(minutes) {
             minutes
+        } else {
+            DEFAULT_INTERVAL_MINUTES
         };
         self
     }
@@ -94,6 +103,23 @@ impl ScheduleSpec {
     fn interval_seconds(&self) -> u64 {
         self.interval_minutes * 60
     }
+}
+
+/// Whether an interval divides an hour, and so can be expressed identically
+/// as a systemd calendar expression and a launchd elapsed interval.
+fn schedulable(minutes: u64) -> bool {
+    minutes > 0 && minutes < 60 && 60 % minutes == 0
+}
+
+/// Whether a value can be safely written into a unit file.
+///
+/// A newline would close the quoted `Environment=` assignment and let the
+/// rest of the value inject directives into the unit; other control
+/// characters are illegal in XML 1.0 and would corrupt the plist. Such a
+/// value is certainly wrong rather than merely awkward, so it is dropped
+/// rather than escaped.
+pub fn is_capturable(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(|c| c.is_control())
 }
 
 /// The result of installing: what was written, and whether the OS accepted
@@ -144,14 +170,10 @@ fn xdg_from_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Where this platform's unit files live, with `XDG_CONFIG_HOME` supplied
-/// explicitly so the override is resolvable without reading process-wide
-/// environment.
-pub fn unit_paths_with_config(
-    platform: Platform,
-    home: &Path,
-    xdg_config_home: Option<&Path>,
-) -> Vec<PathBuf> {
+/// Where this platform's unit files live. `XDG_CONFIG_HOME` is passed in
+/// rather than read here, so the override is resolvable without depending on
+/// process-wide environment.
+pub fn unit_paths(platform: Platform, home: &Path, xdg_config_home: Option<&Path>) -> Vec<PathBuf> {
     match platform {
         Platform::Linux => {
             let base = xdg_config_home
@@ -187,8 +209,14 @@ pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
 }
 
 /// Escapes a value for a double-quoted systemd `Environment=` assignment.
+///
+/// `%` starts a specifier that systemd expands; an unresolvable one makes it
+/// drop the whole assignment, so a literal percent must be doubled.
 fn escape_systemd(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
 }
 
 /// Escapes text for an XML character-data position in the plist.
@@ -297,7 +325,7 @@ pub fn install_with_config(
     spec: &ScheduleSpec,
     runner: &mut dyn CommandRunner,
 ) -> io::Result<Installation> {
-    let paths = unit_paths_with_config(platform, home, xdg_config_home);
+    let paths = unit_paths(platform, home, xdg_config_home);
     for (path, contents) in paths.iter().zip(rendered_units(platform, spec)) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -354,13 +382,18 @@ pub fn install_default(home: &Path, runner: &mut dyn CommandRunner) -> Option<In
 
 /// The environment variables a scheduled run must keep. Only variables the
 /// user actually set are captured; defaults stay defaults.
+///
+/// `HOME` is deliberately absent — both `systemd --user` and launchd agents
+/// set it themselves. `XDG_DATA_HOME` is present because `paths::data_dir`
+/// reads it: a user who exports it only in their shell rc would otherwise
+/// collect into one database interactively and another on the timer.
 fn inherited_environment() -> Vec<(String, String)> {
-    ["AIU_RELAY_URL", "AIU_DATA_DIR"]
+    ["AIU_RELAY_URL", "AIU_DATA_DIR", "XDG_DATA_HOME"]
         .iter()
         .filter_map(|key| {
             std::env::var(key)
                 .ok()
-                .filter(|value| !value.is_empty())
+                .filter(|value| is_capturable(value))
                 .map(|value| (key.to_string(), value))
         })
         .collect()

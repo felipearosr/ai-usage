@@ -113,6 +113,30 @@ fn a_zero_interval_falls_back_to_the_default() {
     assert_eq!(spec.interval_minutes, DEFAULT_INTERVAL_MINUTES);
 }
 
+/// `OnCalendar=*:0/N` is only a valid minute specification when N divides an
+/// hour: systemd rejects `*:0/60` outright, and a non-divisor like 7 leaves a
+/// short gap at the top of every hour, so it is not "every 7 minutes" either.
+/// An interval that cannot be scheduled truthfully on both platforms falls
+/// back to the default rather than rendering a unit systemd refuses to load —
+/// which would silently disable collection altogether.
+#[test]
+fn an_interval_that_does_not_divide_an_hour_falls_back_to_the_default() {
+    for minutes in [7, 45, 60, 90, 3600] {
+        let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).every_minutes(minutes);
+        assert_eq!(
+            spec.interval_minutes, DEFAULT_INTERVAL_MINUTES,
+            "{minutes} does not divide an hour and must not be scheduled"
+        );
+    }
+    for minutes in [1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30] {
+        let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).every_minutes(minutes);
+        assert_eq!(spec.interval_minutes, minutes, "{minutes} divides an hour");
+        assert!(
+            scheduler::render_systemd_timer(&spec).contains(&format!("OnCalendar=*:0/{minutes}"))
+        );
+    }
+}
+
 #[test]
 fn installing_on_linux_writes_user_units_and_enables_the_timer() {
     let root = temp_root("linux");
@@ -219,7 +243,7 @@ fn a_failed_activation_still_leaves_the_units_on_disk() {
 fn xdg_config_home_is_honoured_for_systemd_units() {
     let root = temp_root("xdg");
     let xdg = root.join("custom-config");
-    let paths = scheduler::unit_paths_with_config(Platform::Linux, &root, Some(&xdg));
+    let paths = scheduler::unit_paths(Platform::Linux, &root, Some(&xdg));
     assert_eq!(
         paths,
         vec![
@@ -318,7 +342,42 @@ fn captured_environment_values_are_escaped_for_their_format() {
 
     let service = scheduler::render_systemd_service(&spec);
     assert!(
-        !service.contains("a&b\"q\""),
+        service.contains(r#"Environment="AIU_RELAY_URL=https://host/a&b\"q\"""#),
         "the quoted systemd value escapes its own quotes: {service}"
     );
+}
+
+/// systemd expands `%` specifiers inside `Environment=`. An unescaped `%`
+/// makes it drop the whole assignment ("Failed to resolve specifiers ...
+/// ignoring") — so a percent-encoded relay URL would leave scheduled runs
+/// pointed at the default relay, which is the exact failure this capture
+/// exists to prevent.
+#[test]
+fn a_percent_in_a_captured_value_is_escaped_for_systemd() {
+    let spec = ScheduleSpec::new(PathBuf::from("/usr/local/bin/aiu")).with_environment(vec![(
+        "AIU_RELAY_URL".to_string(),
+        "https://host/a%20b".to_string(),
+    )]);
+
+    let service = scheduler::render_systemd_service(&spec);
+    assert!(
+        service.contains(r#"Environment="AIU_RELAY_URL=https://host/a%%20b""#),
+        "a literal percent is written %% so systemd does not treat it as a specifier: {service}"
+    );
+
+    // The plist has no specifier syntax; the percent stays literal there.
+    assert!(scheduler::render_launchd_plist(&spec).contains("https://host/a%20b"));
+}
+
+/// A value carrying a newline could close the quoted `Environment=`
+/// assignment and inject further directives into the unit. Such a value is
+/// certainly wrong rather than merely awkward, so it is dropped instead of
+/// escaped.
+#[test]
+fn a_captured_value_containing_a_control_character_is_refused() {
+    assert!(scheduler::is_capturable("https://host/ok"));
+    assert!(scheduler::is_capturable("https://relay.example"));
+    assert!(!scheduler::is_capturable("https://host\nExecStart=/bin/sh"));
+    assert!(!scheduler::is_capturable("https://host\u{0}x"));
+    assert!(!scheduler::is_capturable(""));
 }
