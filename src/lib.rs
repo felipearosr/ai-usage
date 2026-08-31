@@ -9,6 +9,7 @@ pub mod cli;
 pub mod collect;
 pub mod discover;
 pub mod error;
+pub mod fleet;
 pub mod hash;
 pub mod identity;
 pub mod import;

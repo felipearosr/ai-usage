@@ -129,6 +129,7 @@ fn enabled_source_is_attempted_even_when_undetected() {
     let results = collect::collect_detected(&store, &home, &ctx()).unwrap();
     assert!(results.is_empty(), "no files to collect, but no failure");
     assert_eq!(event_count(&store, "claude"), 0);
+    assert_eq!(store.device_sources("dev-test").unwrap(), vec!["claude"]);
 
     let _ = std::fs::remove_dir_all(&home);
 }

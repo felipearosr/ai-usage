@@ -58,6 +58,9 @@ pub struct WindowDetail {
 pub struct VendorQuota {
     pub used_percent: f64,
     pub resets_at_utc: Option<String>,
+    pub observed_at_utc: String,
+    pub observing_device_name: String,
+    pub observer_last_sync_at_utc: Option<String>,
 }
 
 impl VendorQuota {
@@ -68,6 +71,16 @@ impl VendorQuota {
             .filter(|resets| *resets > now_epoch)
             .map(|resets| resets - now_epoch)
     }
+
+    pub fn observation_age_secs(&self, now_epoch: u64) -> Option<u64> {
+        crate::report::sync_age_secs(Some(&self.observed_at_utc), now_epoch)
+    }
+
+    pub fn is_stale(&self, now_epoch: u64) -> bool {
+        self.observation_age_secs(now_epoch)
+            .is_none_or(|age| age > crate::report::STALE_AFTER_SECS)
+            || crate::report::is_stale_at(self.observer_last_sync_at_utc.as_deref(), now_epoch)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -75,6 +88,8 @@ pub struct Share {
     pub name: String,
     pub output_tokens: i64,
     pub share_percent: f64,
+    pub stale: bool,
+    pub last_sync_at_utc: Option<String>,
 }
 
 /// Builds the detail view through the same queries the CLI renders.
@@ -89,17 +104,18 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
         // otherwise breakdown rows would not match the window shown.
         let cutoff = span.map(|s| utc::format_epoch(now_epoch.saturating_sub(s)));
         let machines = match &cutoff {
-            Some(cutoff) => shares(
+            Some(cutoff) => machine_shares(
                 conn,
-                "SELECT d.friendly_name, SUM(e.output_tokens)
+                "SELECT d.friendly_name, SUM(e.output_tokens), d.last_sync_at_utc
                  FROM usage_events e
                  JOIN devices d ON d.device_id = e.device_id
                  WHERE e.source = ?1 AND e.ts_utc >= ?2
-                 GROUP BY e.device_id, d.friendly_name
+                 GROUP BY e.device_id, d.friendly_name, d.last_sync_at_utc
                  HAVING SUM(e.output_tokens) > 0
                  ORDER BY SUM(e.output_tokens) DESC, d.friendly_name ASC",
                 source,
                 cutoff,
+                now_epoch,
             )?,
             None => Vec::new(),
         };
@@ -122,6 +138,9 @@ pub fn build(store: &Store, source: &str, now_epoch: u64) -> crate::error::Resul
             vendor: Some(VendorQuota {
                 used_percent: quota.used_percent,
                 resets_at_utc: quota.resets_at_utc,
+                observed_at_utc: quota.observed_at_utc,
+                observing_device_name: quota.observing_device_name,
+                observer_last_sync_at_utc: quota.observer_last_sync_at_utc,
             }),
             machines,
             models,
@@ -154,6 +173,38 @@ fn shares(
     Ok(rows
         .into_iter()
         .map(|(name, tokens)| Share {
+            share_percent: share_percent(tokens, total),
+            name,
+            output_tokens: tokens,
+            stale: false,
+            last_sync_at_utc: None,
+        })
+        .collect())
+}
+
+fn machine_shares(
+    conn: &rusqlite::Connection,
+    query: &str,
+    source: &str,
+    cutoff_utc: &str,
+    now_epoch: u64,
+) -> crate::error::Result<Vec<Share>> {
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt
+        .query_map(params![source, cutoff_utc], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let total: i64 = rows.iter().map(|(_, tokens, _)| *tokens).sum();
+    Ok(rows
+        .into_iter()
+        .map(|(name, tokens, last_sync)| Share {
+            stale: crate::report::is_stale_at(last_sync.as_deref(), now_epoch),
+            last_sync_at_utc: last_sync,
             share_percent: share_percent(tokens, total),
             name,
             output_tokens: tokens,

@@ -47,6 +47,11 @@ fn matrix_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value {
             "models": matrix.models,
             "machines": matrix.machines,
             "machine_ids": matrix.machine_ids,
+            "machine_stale": matrix.machine_stale,
+            "machine_last_sync_at": matrix.machine_last_sync_at_utc,
+            "machine_last_sync_age_secs": matrix.machine_last_sync_at_utc.iter()
+                .map(|last_sync| crate::report::sync_age_secs(last_sync.as_deref(), now))
+                .collect::<Vec<_>>(),
             "cells": matrix.cells,
             "model_totals": matrix.model_totals(),
             "machine_totals": matrix.machine_totals(),
@@ -71,6 +76,12 @@ fn machines_window_json(window: &WindowBreakdown, now: u64) -> serde_json::Value
                 "name": name,
                 "output_tokens": total,
                 "share_percent": share_percent(total, grand),
+                "stale": matrix.machine_stale[j],
+                "last_sync_at": matrix.machine_last_sync_at_utc[j],
+                "last_sync_age_secs": crate::report::sync_age_secs(
+                    matrix.machine_last_sync_at_utc[j].as_deref(),
+                    now,
+                ),
                 "models": matrix.models_for_machine(j)
                     .iter()
                     .map(|m| {

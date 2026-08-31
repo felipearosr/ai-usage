@@ -8,7 +8,7 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::store::{NewEvent, NewSnapshot};
+use crate::store::{DeviceSyncState, NewEvent, NewSnapshot};
 
 #[derive(Debug)]
 pub enum SyncError {
@@ -78,6 +78,7 @@ impl Drop for WorkspaceKey {
 
 pub struct SyncConfig {
     pub workspace_id: String,
+    pub device_id: String,
     pub device_credential: String,
     pub key: WorkspaceKey,
     pub download_limit: usize,
@@ -90,11 +91,20 @@ pub struct SyncSummary {
     pub duplicates_ignored: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DeviceRevocation {
+    pub workspace_id: String,
+    pub device_id: String,
+    pub revoked_at_utc: String,
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", content = "record")]
 pub enum SyncRecord {
     UsageEvent(Box<NewEvent>),
     QuotaSnapshot(Box<NewSnapshot>),
+    DeviceState(Box<DeviceSyncState>),
+    DeviceRevocation(Box<DeviceRevocation>),
 }
 
 impl SyncRecord {
@@ -102,6 +112,8 @@ impl SyncRecord {
         match self {
             SyncRecord::UsageEvent(event) => event.workspace_id == workspace_id,
             SyncRecord::QuotaSnapshot(_) => true,
+            SyncRecord::DeviceState(device) => device.workspace_id == workspace_id,
+            SyncRecord::DeviceRevocation(device) => device.workspace_id == workspace_id,
         }
     }
 }
@@ -156,6 +168,13 @@ pub trait RelayClient {
         after_cursor: Option<&str>,
         limit: usize,
     ) -> std::result::Result<DownloadBatch, RelayError>;
+
+    fn revoke_device(
+        &mut self,
+        device_credential: &str,
+        workspace_id: &str,
+        device_id: &str,
+    ) -> std::result::Result<(), RelayError>;
 }
 
 pub fn encrypt_record(
@@ -239,18 +258,72 @@ pub fn enqueue_record(
     let kind = match record {
         SyncRecord::UsageEvent(_) => "usage_event",
         SyncRecord::QuotaSnapshot(_) => "quota_snapshot",
+        SyncRecord::DeviceState(_) => "device_state",
+        SyncRecord::DeviceRevocation(_) => "device_revocation",
     };
     let payload = serde_json::to_vec(record)?;
     store.enqueue_sync_record(&local_record_id(&payload), kind, &payload)
 }
 
-/// Uploads the durable outbox, then downloads and applies one cursor page.
-/// Outbox rows are marked sent only after the relay accepts the whole batch.
+/// Uploads the durable outbox, then downloads and applies every available
+/// cursor page. Outbox rows are marked sent only after the relay accepts the
+/// whole batch.
 pub fn sync_once(
     store: &crate::store::Store,
     relay: &mut dyn RelayClient,
     config: &SyncConfig,
 ) -> Result<SyncSummary> {
+    let uploaded = upload_pending(store, relay, config)?;
+
+    let mut summary = SyncSummary {
+        uploaded,
+        ..SyncSummary::default()
+    };
+    let download_limit = config.download_limit.max(1);
+    loop {
+        let cursor = store.sync_cursor()?;
+        let batch = relay.download(
+            &config.device_credential,
+            &config.workspace_id,
+            cursor.as_deref(),
+            download_limit,
+        )?;
+        let record_count = batch.records.len();
+        for encrypted_record in &batch.records {
+            if encrypted_record.workspace_id != config.workspace_id {
+                return Err(SyncError::WorkspaceMismatch);
+            }
+            if store.sync_record_applied(&encrypted_record.record_id)? {
+                summary.duplicates_ignored += 1;
+                continue;
+            }
+            let record = decrypt_record(&config.key, encrypted_record)?;
+            if !record.belongs_to(&config.workspace_id) {
+                return Err(SyncError::WorkspaceMismatch);
+            }
+            apply_record(store, &record, &config.device_id)?;
+            store.mark_sync_record_applied(&encrypted_record.record_id)?;
+            summary.downloaded += 1;
+        }
+        store.set_sync_cursor(&batch.cursor)?;
+        if record_count < download_limit {
+            break;
+        }
+    }
+    let sync_at = crate::utc::now_rfc3339();
+    let device =
+        store.device_sync_state(&config.workspace_id, &config.device_id, Some(&sync_at))?;
+    enqueue_record(store, &SyncRecord::DeviceState(Box::new(device)))?;
+    summary.uploaded += upload_pending(store, relay, config)?;
+    store.touch_device_sync(&config.device_id, &sync_at)?;
+    Ok(summary)
+}
+
+fn upload_pending(
+    store: &crate::store::Store,
+    relay: &mut dyn RelayClient,
+    config: &SyncConfig,
+) -> Result<usize> {
     let pending = store.pending_sync_records()?;
     let encrypted = pending
         .iter()
@@ -262,48 +335,23 @@ pub fn sync_once(
             encrypt_record(&config.workspace_id, &config.key, &record)
         })
         .collect::<Result<Vec<_>>>()?;
-
-    if !encrypted.is_empty() {
-        relay.upload(&config.device_credential, &encrypted)?;
-        let ids = pending
-            .iter()
-            .map(|item| item.outbox_id)
-            .collect::<Vec<_>>();
-        store.mark_sync_records_sent(&ids)?;
+    if encrypted.is_empty() {
+        return Ok(0);
     }
-
-    let cursor = store.sync_cursor()?;
-    let batch = relay.download(
-        &config.device_credential,
-        &config.workspace_id,
-        cursor.as_deref(),
-        config.download_limit.max(1),
-    )?;
-    let mut summary = SyncSummary {
-        uploaded: encrypted.len(),
-        ..SyncSummary::default()
-    };
-    for encrypted_record in &batch.records {
-        if encrypted_record.workspace_id != config.workspace_id {
-            return Err(SyncError::WorkspaceMismatch);
-        }
-        if store.sync_record_applied(&encrypted_record.record_id)? {
-            summary.duplicates_ignored += 1;
-            continue;
-        }
-        let record = decrypt_record(&config.key, encrypted_record)?;
-        if !record.belongs_to(&config.workspace_id) {
-            return Err(SyncError::WorkspaceMismatch);
-        }
-        apply_record(store, &record)?;
-        store.mark_sync_record_applied(&encrypted_record.record_id)?;
-        summary.downloaded += 1;
-    }
-    store.set_sync_cursor(&batch.cursor)?;
-    Ok(summary)
+    relay.upload(&config.device_credential, &encrypted)?;
+    let ids = pending
+        .iter()
+        .map(|item| item.outbox_id)
+        .collect::<Vec<_>>();
+    store.mark_sync_records_sent(&ids)?;
+    Ok(encrypted.len())
 }
 
-fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> {
+fn apply_record(
+    store: &crate::store::Store,
+    record: &SyncRecord,
+    local_device_id: &str,
+) -> Result<()> {
     match record {
         SyncRecord::UsageEvent(event) => {
             ensure_device(store, &event.device_id)?;
@@ -312,6 +360,18 @@ fn apply_record(store: &crate::store::Store, record: &SyncRecord) -> Result<()> 
         SyncRecord::QuotaSnapshot(snapshot) => {
             ensure_device(store, &snapshot.observing_device_id)?;
             store.record_snapshot_if_changed(snapshot)?;
+        }
+        SyncRecord::DeviceState(device) => {
+            if device.device_id == local_device_id {
+                let mut device = (**device).clone();
+                device.sources = None;
+                store.apply_device_sync_state(&device)?;
+            } else {
+                store.apply_device_sync_state(device)?;
+            }
+        }
+        SyncRecord::DeviceRevocation(device) => {
+            store.mark_device_revoked(&device.device_id, &device.revoked_at_utc)?
         }
     }
     Ok(())

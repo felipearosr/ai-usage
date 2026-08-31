@@ -55,7 +55,7 @@ fn render_matrix_window(out: &mut String, window: &WindowBreakdown, now: u64) {
     }
 
     out.push_str("machine × model matrix (share of window output tokens):\n");
-    render_matrix_table(out, &window.matrix);
+    render_matrix_table(out, &window.matrix, now);
 }
 
 fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) {
@@ -73,9 +73,14 @@ fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) 
         window.window
     ));
     for (j, share) in window.matrix.machine_shares().iter().enumerate() {
+        let name = crate::report::machine_freshness_label(
+            &share.name,
+            share.last_sync_at_utc.as_deref(),
+            now,
+        );
         out.push_str(&format!(
             "  {:<18} {:>8}  {:>5.1}%\n",
-            share.name,
+            name,
             humanize_tokens(share.output_tokens),
             share.share_percent
         ));
@@ -90,7 +95,7 @@ fn render_machines_window(out: &mut String, window: &WindowBreakdown, now: u64) 
     }
 }
 
-fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matrix) {
+fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matrix, now: u64) {
     let grand = matrix.grand_total();
     let label_width = matrix
         .models
@@ -99,8 +104,15 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
         .max()
         .unwrap_or(0)
         .max(2);
-    let col_widths: Vec<usize> = matrix
+    let machine_labels = matrix
         .machines
+        .iter()
+        .zip(&matrix.machine_last_sync_at_utc)
+        .map(|(name, last_sync)| {
+            crate::report::machine_freshness_label(name, last_sync.as_deref(), now)
+        })
+        .collect::<Vec<_>>();
+    let col_widths: Vec<usize> = machine_labels
         .iter()
         .map(|m| m.len().max(PCT_WIDTH))
         .collect();
@@ -108,7 +120,7 @@ fn render_matrix_table(out: &mut String, matrix: &crate::report::breakdown::Matr
 
     // Header: machine names across the top, "total" column on the right.
     out.push_str(&format!("  {:<label_width$}  ", ""));
-    for (j, machine) in matrix.machines.iter().enumerate() {
+    for (j, machine) in machine_labels.iter().enumerate() {
         out.push_str(&format!("{:>width$}  ", machine, width = col_widths[j]));
     }
     out.push_str(&format!("{:>total_width$}\n", "total"));

@@ -40,6 +40,26 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Machines { json }) => {
+            if let Err(e) = run_machines(json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::MachineRename { device, name }) => {
+            if let Err(e) = run_machine_rename(&device, &name) {
+                die(1, e);
+            }
+        }
+        Ok(Command::MachineRemove { device }) => {
+            if let Err(e) = run_machine_remove(&device) {
+                die(1, e);
+            }
+        }
+        Ok(Command::Sync) => {
+            if let Err(e) = run_sync() {
+                die(1, e);
+            }
+        }
         Ok(Command::Init) => {
             if let Err(e) = run_init() {
                 die(1, e);
@@ -62,6 +82,50 @@ fn die(code: i32, err: impl std::fmt::Display) -> ! {
 fn open_store() -> Result<Store, Box<dyn std::error::Error>> {
     let db_path = paths::db_path().ok_or(aiu::error::AiuError::NoDataDir)?;
     Ok(Store::open(&db_path)?)
+}
+
+fn run_machines(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = refreshed_store()?;
+    let report = report::fleet::build(&store, aiu::utc::now_epoch())?;
+    if json {
+        println!("{}", report::fleet::render_json(&report));
+    } else {
+        print!("{}", report::fleet::render_text(&report));
+    }
+    Ok(())
+}
+
+fn run_sync() -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    quick_collect(&store)?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    let summary = aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!(
+        "Synced: {} uploaded, {} downloaded, {} duplicates ignored.",
+        summary.uploaded, summary.downloaded, summary.duplicates_ignored
+    );
+    Ok(())
+}
+
+fn run_machine_rename(device: &str, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let device_id = aiu::fleet::rename_machine(&store, &config.workspace_id, device, name)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!("Renamed {device_id} to {}.", name.trim());
+    Ok(())
+}
+
+fn run_machine_remove(device: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let config = aiu::setup::load_sync_config(&store, 500)?;
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    let device_id = aiu::fleet::remove_machine(&store, &mut relay, &config, device)?;
+    aiu::sync::sync_once(&store, &mut relay, &config)?;
+    println!("Removed {device_id}. Historical usage was kept.");
+    Ok(())
 }
 
 fn prompt_machine_name() -> Result<String, Box<dyn std::error::Error>> {
@@ -194,8 +258,7 @@ fn quick_collect(store: &Store) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
-    quick_collect(&store)?;
+    let store = refreshed_store()?;
     let report = report::build(&store, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", report::json::render(&report));
@@ -206,7 +269,7 @@ fn run_report(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn run_detail(source: &str, json_format: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
+    let store = refreshed_store()?;
     let detail = detail::build(&store, source, aiu::utc::now_epoch())?;
     if json_format {
         print!("{}", detail::json::render(&detail));
@@ -221,7 +284,7 @@ fn run_breakdown(
     kind: BreakdownKind,
     json_format: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let store = open_store()?;
+    let store = refreshed_store()?;
     let breakdown = breakdown::build(&store, source, aiu::utc::now_epoch())?;
     match (kind, json_format) {
         (BreakdownKind::Models, true) => print!("{}", breakdown::json::render_matrix(&breakdown)),
@@ -234,6 +297,33 @@ fn run_breakdown(
         }
     }
     Ok(())
+}
+
+fn refreshed_store() -> Result<Store, Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    quick_collect(&store)?;
+    sync_before_report(&store);
+    Ok(store)
+}
+
+fn sync_before_report(store: &Store) {
+    match aiu::setup::is_initialized(store) {
+        Ok(false) => return,
+        Err(error) => {
+            eprintln!("aiu: sync status unavailable; showing local data: {error}");
+            return;
+        }
+        Ok(true) => {}
+    }
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let config = aiu::setup::load_sync_config(store, 500)?;
+        let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+        aiu::sync::sync_once(store, &mut relay, &config)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("aiu: sync failed; showing local data: {error}");
+    }
 }
 
 fn run_sources(json_format: bool) -> Result<(), Box<dyn std::error::Error>> {

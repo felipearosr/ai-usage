@@ -28,6 +28,10 @@ pub(crate) fn vendor_json(vendor: &Option<VendorQuota>, now: u64) -> serde_json:
             "used_percent": vendor.used_percent,
             "resets_at": vendor.resets_at_utc,
             "resets_in_secs": vendor.resets_in_secs(now),
+            "observed_at": vendor.observed_at_utc,
+            "observation_age_secs": vendor.observation_age_secs(now),
+            "observing_device": vendor.observing_device_name,
+            "stale": vendor.is_stale(now),
         }),
         None => serde_json::Value::Null,
     }
@@ -42,10 +46,32 @@ fn window_json(window: &WindowDetail, now: u64) -> serde_json::Value {
         "vendor": vendor,
         "attribution": {
             "total_output_tokens": total,
-            "machines": shares_json(&window.machines),
+            "machines": machine_shares_json(&window.machines, now),
             "models": shares_json(&window.models),
         },
     })
+}
+
+fn machine_shares_json(
+    shares: &[crate::report::detail::Share],
+    now: u64,
+) -> Vec<serde_json::Value> {
+    shares
+        .iter()
+        .map(|share| {
+            json!({
+                "name": share.name,
+                "output_tokens": share.output_tokens,
+                "share_percent": share.share_percent,
+                "stale": share.stale,
+                "last_sync_at": share.last_sync_at_utc,
+                "last_sync_age_secs": crate::report::sync_age_secs(
+                    share.last_sync_at_utc.as_deref(),
+                    now,
+                ),
+            })
+        })
+        .collect()
 }
 
 fn shares_json(shares: &[crate::report::detail::Share]) -> Vec<serde_json::Value> {

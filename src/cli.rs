@@ -36,6 +36,17 @@ pub enum Command {
         source: String,
         json: bool,
     },
+    Machines {
+        json: bool,
+    },
+    MachineRename {
+        device: String,
+        name: String,
+    },
+    MachineRemove {
+        device: String,
+    },
+    Sync,
     Init,
     Join {
         code: String,
@@ -72,6 +83,11 @@ USAGE:
     aiu sources [--json]            list detection + per-source overrides
     aiu sources detect [--json]     re-run source detection
     aiu sources <mode> <source>     enable | disable | auto a source
+    aiu machines [--json]           global machine health and participation
+    aiu machine rename <device> <name>
+                                    rename a machine across the workspace
+    aiu machine remove <device>     revoke a machine without deleting history
+    aiu sync                        collect and synchronize now
     aiu init                        create a workspace and pairing code
     aiu join <code>                 join an existing workspace
 
@@ -122,6 +138,10 @@ where
 
     match positionals.as_slice() {
         [] => Ok(Command::Report { json }),
+        [command] if command == "sync" && !json => Ok(Command::Sync),
+        [command, ..] if command == "sync" => Err(ArgsError(format!(
+            "invalid sync command\nusage: aiu sync\n\n{USAGE}"
+        ))),
         [command] if command == "init" && !json => Ok(Command::Init),
         [command, code] if command == "join" && !json => Ok(Command::Join { code: code.clone() }),
         [command, ..] if command == "init" || command == "join" => Err(ArgsError(format!(
@@ -144,6 +164,27 @@ where
         [s, ..] if s == "sources" => Err(ArgsError(format!(
             "unknown sources command\navailable: detect, enable <source>, disable <source>, auto <source>\n\n{USAGE}"
         ))),
+        [command] if command == "machines" => Ok(Command::Machines { json }),
+        [command, action, device, name]
+            if command == "machine" && action == "rename" && !json =>
+        {
+            Ok(Command::MachineRename {
+                device: device.clone(),
+                name: name.clone(),
+            })
+        }
+        [command, action, device]
+            if command == "machine" && action == "remove" && !json =>
+        {
+            Ok(Command::MachineRemove {
+                device: device.clone(),
+            })
+        }
+        [command, ..] if command == "machine" || command == "machines" => Err(ArgsError(
+            format!(
+                "invalid machine command\nusage: aiu machines [--json] | aiu machine rename <device> <name> | aiu machine remove <device>\n\n{USAGE}"
+            ),
+        )),
         [source] if is_source(source) => Ok(Command::Detail {
             source: source.clone(),
             json,
@@ -188,6 +229,12 @@ mod tests {
     #[test]
     fn no_args_means_text_report() {
         assert_eq!(parse(args(&[])).unwrap(), Command::Report { json: false });
+    }
+
+    #[test]
+    fn sync_is_recognized() {
+        assert_eq!(parse(args(&["sync"])).unwrap(), Command::Sync);
+        assert!(parse(args(&["sync", "--json"])).is_err());
     }
 
     #[test]
@@ -253,6 +300,28 @@ mod tests {
         assert!(parse(args(&["frobnicate"])).is_err());
         assert!(parse(args(&["--wat"])).is_err());
         assert!(parse(args(&["claude", "extra"])).is_err());
+    }
+
+    #[test]
+    fn fleet_commands_are_recognized() {
+        assert_eq!(
+            parse(args(&["machines", "--json"])).unwrap(),
+            Command::Machines { json: true }
+        );
+        assert_eq!(
+            parse(args(&["machine", "rename", "device-a", "studio"])).unwrap(),
+            Command::MachineRename {
+                device: "device-a".into(),
+                name: "studio".into(),
+            }
+        );
+        assert_eq!(
+            parse(args(&["machine", "remove", "device-a"])).unwrap(),
+            Command::MachineRemove {
+                device: "device-a".into(),
+            }
+        );
+        assert!(parse(args(&["machine", "remove", "device-a", "--json"])).is_err());
     }
 
     #[test]

@@ -62,6 +62,7 @@ impl PairingRelay for FakeRelay {
     fn register_workspace(
         &mut self,
         workspace_id: &str,
+        _device_id: &str,
         device_credential: &str,
     ) -> Result<(), PairingRelayError> {
         self.workspace_credentials
@@ -209,6 +210,19 @@ impl RelayClient for FakeRelay {
             cursor: (start + records.len()).to_string(),
             records,
         })
+    }
+
+    fn revoke_device(
+        &mut self,
+        credential: &str,
+        workspace_id: &str,
+        _device_id: &str,
+    ) -> Result<(), RelayError> {
+        if self.authorized(workspace_id, credential) {
+            Ok(())
+        } else {
+            Err(RelayError::Revoked)
+        }
     }
 }
 

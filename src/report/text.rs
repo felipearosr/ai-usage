@@ -23,7 +23,7 @@ pub fn render(report: &Report) -> String {
         for device in &report.devices {
             let age = device.age_secs(report.generated_at_epoch);
             let detail = match age {
-                Some(secs) => format!("synced {} ago", utc::humanize_duration_secs(secs)),
+                Some(secs) => format!("synced {}", crate::report::humanize_sync_age(secs)),
                 None => "never synced".to_string(),
             };
             if device.is_stale(report.generated_at_epoch) {
@@ -54,6 +54,20 @@ fn render_source(out: &mut String, source: &crate::report::SourceReport, now: u6
                 utc::humanize_duration_secs(secs)
             ));
         }
+        if window.is_stale(now) {
+            line.push_str(" · STALE");
+        }
+        let observed = window
+            .observation_age_secs(now)
+            .map(crate::report::humanize_sync_age)
+            .unwrap_or_else(|| "at an invalid time".to_string());
+        line.push_str(&format!(
+            " · observed {observed} by {}",
+            window.observing_device_name
+        ));
+        if window.observer_last_sync_at_utc.is_none() {
+            line.push_str(" (device never synced)");
+        }
         out.push_str(&line);
         out.push('\n');
     }
@@ -65,9 +79,15 @@ fn render_source(out: &mut String, source: &crate::report::SourceReport, now: u6
 
     // A "top" line per source: participating machine first, then exact model.
     if let Some(machine) = &source.top_machine {
+        let stale = if source.top_machine_stale {
+            " STALE"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "  top machine  {} ({} out tok, all-time)\n",
+            "  top machine  {}{} ({} out tok, all-time)\n",
             machine.name,
+            stale,
             humanize_tokens(machine.output_tokens)
         ));
     }
