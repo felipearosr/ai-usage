@@ -321,9 +321,9 @@ fn run_machine_rename(device: &str, name: &str) -> Result<(), Box<dyn std::error
     let store = open_store()?;
     let config = aiu::setup::load_sync_config(&store, 500)?;
     let device_id = aiu::fleet::rename_machine(&store, &config.workspace_id, device, name)?;
-    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
-    aiu::sync::sync_once(&store, &mut relay, &config)?;
     println!("Renamed {device_id} to {}.", name.trim());
+    let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    propagate(&store, &mut relay, &config);
     Ok(())
 }
 
@@ -331,10 +331,29 @@ fn run_machine_remove(device: &str) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_store()?;
     let config = aiu::setup::load_sync_config(&store, 500)?;
     let mut relay = aiu::relay::HttpRelayClient::from_env()?;
+    // Revocation itself goes through the relay: if that fails the machine
+    // still has sync access, so the command has genuinely not done its job.
     let device_id = aiu::fleet::remove_machine(&store, &mut relay, &config, device)?;
-    aiu::sync::sync_once(&store, &mut relay, &config)?;
     println!("Removed {device_id}. Historical usage was kept.");
+    propagate(&store, &mut relay, &config);
     Ok(())
+}
+
+/// Pushes a fleet change out now, reporting an unreachable relay as a delay
+/// rather than a failure.
+///
+/// The change is already applied locally and already queued in the durable
+/// outbox, so the next successful sync carries it. Failing the command here
+/// would tell the user their rename did not happen when it did, and send them
+/// to repeat an operation that is already done.
+fn propagate(
+    store: &Store,
+    relay: &mut aiu::relay::HttpRelayClient,
+    config: &aiu::sync::SyncConfig,
+) {
+    if let Err(error) = aiu::sync::sync_once(store, relay, config) {
+        eprintln!("aiu: queued, but not yet synced to other machines: {error}");
+    }
 }
 
 fn prompt_machine_name() -> Result<String, Box<dyn std::error::Error>> {
