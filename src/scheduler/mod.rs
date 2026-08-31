@@ -9,8 +9,15 @@
 //! parameter rather than a `cfg!`, and activation goes through
 //! [`CommandRunner`] rather than spawning `systemctl`/`launchctl` directly.
 
+mod units;
+
 use std::io;
 use std::path::{Path, PathBuf};
+
+use units::{parse_launchd, parse_systemd};
+// The renderers stay part of the scheduler's public surface; `units` itself
+// is private, so the split adds no new path and really is internal.
+pub use units::{render_launchd_plist, render_systemd_service, render_systemd_timer};
 
 /// The scheduled interval the spec fixes for collection.
 pub const DEFAULT_INTERVAL_MINUTES: u64 = 15;
@@ -166,7 +173,9 @@ fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
 }
 
-fn xdg_from_env() -> Option<PathBuf> {
+/// `XDG_CONFIG_HOME` as this process sees it. Passed explicitly into the
+/// functions that need it so unit locations never depend on ambient state.
+pub fn config_home_from_env() -> Option<PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -190,112 +199,6 @@ pub fn unit_paths(platform: Platform, home: &Path, xdg_config_home: Option<&Path
     }
 }
 
-/// The systemd unit that performs one collection and exits.
-pub fn render_systemd_service(spec: &ScheduleSpec) -> String {
-    let environment: String = spec
-        .environment
-        .iter()
-        .filter(|(_, value)| is_capturable(value))
-        .map(|(key, value)| format!("Environment=\"{key}={}\"\n", escape_systemd(value)))
-        .collect();
-    format!(
-        "[Unit]\n\
-         Description=aiu — collect AI coding usage\n\
-         Documentation=https://github.com/felipearosr/ai-usage\n\
-         \n\
-         [Service]\n\
-         Type=oneshot\n\
-         {environment}\
-         ExecStart=\"{}\" collect\n",
-        escape_systemd(&spec.exe.display().to_string())
-    )
-}
-
-/// Escapes a value for a double-quoted systemd `Environment=` assignment.
-///
-/// `%` starts a specifier that systemd expands; an unresolvable one makes it
-/// drop the whole assignment, so a literal percent must be doubled.
-fn escape_systemd(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('%', "%%")
-}
-
-/// Escapes text for an XML character-data position in the plist.
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-/// The timer that starts the service on the scheduled interval.
-pub fn render_systemd_timer(spec: &ScheduleSpec) -> String {
-    format!(
-        "[Unit]\n\
-         Description=aiu — collect AI coding usage every {minutes} minutes\n\
-         \n\
-         [Timer]\n\
-         OnCalendar=*:0/{minutes}\n\
-         AccuracySec=1min\n\
-         Persistent=true\n\
-         Unit={service}\n\
-         \n\
-         [Install]\n\
-         WantedBy=timers.target\n",
-        minutes = spec.interval_minutes,
-        service = SYSTEMD_SERVICE,
-    )
-}
-
-/// The launchd agent. `StartInterval` re-runs a program that has exited, so
-/// there is no `KeepAlive` and nothing stays resident.
-pub fn render_launchd_plist(spec: &ScheduleSpec) -> String {
-    let environment = if !spec.environment.iter().any(|(_, v)| is_capturable(v)) {
-        String::new()
-    } else {
-        let entries: String = spec
-            .environment
-            .iter()
-            .filter(|(_, value)| is_capturable(value))
-            .map(|(key, value)| {
-                format!(
-                    "        <key>{}</key>\n        <string>{}</string>\n",
-                    escape_xml(key),
-                    escape_xml(value)
-                )
-            })
-            .collect();
-        format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}    </dict>\n")
-    };
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
-         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-         <plist version=\"1.0\">\n\
-         <dict>\n    \
-             <key>Label</key>\n    \
-             <string>{label}</string>\n    \
-             <key>ProgramArguments</key>\n    \
-             <array>\n        \
-                 <string>{exe}</string>\n        \
-                 <string>collect</string>\n    \
-             </array>\n    \
-             <key>StartInterval</key>\n    \
-             <integer>{seconds}</integer>\n    \
-             <key>RunAtLoad</key>\n    \
-             <false/>\n\
-         {environment}\
-         </dict>\n\
-         </plist>\n",
-        label = LAUNCHD_LABEL,
-        exe = escape_xml(&spec.exe.display().to_string()),
-        seconds = spec.interval_seconds(),
-    )
-}
-
 fn rendered_units(platform: Platform, spec: &ScheduleSpec) -> Vec<String> {
     match platform {
         Platform::Linux => vec![render_systemd_service(spec), render_systemd_timer(spec)],
@@ -311,18 +214,6 @@ fn rendered_units(platform: Platform, spec: &ScheduleSpec) -> Vec<String> {
 /// so the next login picks them up. Such a run returns `activated: false`
 /// rather than an error.
 pub fn install(
-    platform: Platform,
-    home: &Path,
-    spec: &ScheduleSpec,
-    runner: &mut dyn CommandRunner,
-) -> io::Result<Installation> {
-    install_with_config(platform, home, xdg_from_env().as_deref(), spec, runner)
-}
-
-/// [`install`] with `XDG_CONFIG_HOME` supplied explicitly, so a caller (and
-/// the test suite) can place units under a chosen root regardless of the
-/// ambient environment.
-pub fn install_with_config(
     platform: Platform,
     home: &Path,
     xdg_config_home: Option<&Path>,
@@ -381,7 +272,21 @@ pub fn install_default(home: &Path, runner: &mut dyn CommandRunner) -> Option<In
     let platform = current_platform()?;
     let exe = std::env::current_exe().ok()?;
     let spec = ScheduleSpec::new(exe).with_environment(inherited_environment());
-    install(platform, home, &spec, runner).ok()
+    install(
+        platform,
+        home,
+        config_home_from_env().as_deref(),
+        &spec,
+        runner,
+    )
+    .ok()
+}
+
+/// The schedule this machine would install right now, for comparison against
+/// what is actually installed. `None` when the running binary's path cannot
+/// be resolved, since there would be nothing to compare.
+pub fn current_spec() -> Option<ScheduleSpec> {
+    Some(ScheduleSpec::new(std::env::current_exe().ok()?).with_environment(inherited_environment()))
 }
 
 /// The environment variables a scheduled run must keep. Only variables the
@@ -417,6 +322,211 @@ pub fn describe(installation: Option<&Installation>) -> String {
         ),
         None => "automatic collection is not installed; run `aiu collect` manually".to_string(),
     }
+}
+
+/// A schedule as it actually exists on disk, recovered from the unit files
+/// themselves rather than from any record aiu keeps — the units are what the
+/// OS acts on, and a sidecar could disagree with them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledSchedule {
+    pub platform: Platform,
+    /// What the units say they will run, in the same shape as the spec that
+    /// would be installed now — so drift is a comparison of like with like.
+    pub spec: ScheduleSpec,
+    pub unit_paths: Vec<PathBuf>,
+}
+
+/// One way the installed schedule disagrees with what this machine would
+/// install now. Each variant names the value, so the report can tell the user
+/// what to fix rather than only that something is stale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drift {
+    ExePath {
+        installed: PathBuf,
+        current: PathBuf,
+    },
+    Interval {
+        installed: u64,
+        current: u64,
+    },
+    Environment {
+        key: String,
+        installed: Option<String>,
+        current: Option<String>,
+    },
+}
+
+/// Whether every unit this platform needs is present. A systemd install is
+/// two files, and one alone is not a working schedule.
+pub fn is_installed(platform: Platform, home: &Path, xdg_config_home: Option<&Path>) -> bool {
+    let paths = unit_paths(platform, home, xdg_config_home);
+    !paths.is_empty() && paths.iter().all(|path| path.is_file())
+}
+
+/// Recovers the installed schedule from its unit files, or `None` when no
+/// complete install is present or the units cannot be parsed.
+pub fn read_installed(
+    platform: Platform,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+) -> Option<InstalledSchedule> {
+    let unit_paths = unit_paths(platform, home, xdg_config_home);
+    if !is_installed(platform, home, xdg_config_home) {
+        return None;
+    }
+    let contents = unit_paths
+        .iter()
+        .map(std::fs::read_to_string)
+        .collect::<io::Result<Vec<_>>>()
+        .ok()?;
+
+    let parsed = match platform {
+        Platform::Linux => parse_systemd(&contents[0], &contents[1])?,
+        Platform::MacOs => parse_launchd(&contents[0])?,
+    };
+
+    Some(InstalledSchedule {
+        platform,
+        spec: ScheduleSpec {
+            exe: parsed.exe,
+            interval_minutes: parsed.interval_minutes,
+            environment: parsed.environment,
+        },
+        unit_paths,
+    })
+}
+
+/// Every way the installed schedule disagrees with `current`. An empty result
+/// means a scheduled run would behave exactly as an interactive one.
+pub fn drift(installed: &InstalledSchedule, current: &ScheduleSpec) -> Vec<Drift> {
+    // Both sides are a ScheduleSpec, so every field compares directly.
+    let installed = &installed.spec;
+    let mut drift = Vec::new();
+    if installed.exe != current.exe {
+        drift.push(Drift::ExePath {
+            installed: installed.exe.clone(),
+            current: current.exe.clone(),
+        });
+    }
+    if installed.interval_minutes != current.interval_minutes {
+        drift.push(Drift::Interval {
+            installed: installed.interval_minutes,
+            current: current.interval_minutes,
+        });
+    }
+
+    let lookup = |pairs: &[(String, String)], key: &str| {
+        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    };
+    let mut keys: Vec<&str> = installed
+        .environment
+        .iter()
+        .chain(current.environment.iter())
+        .map(|(key, _)| key.as_str())
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    for key in keys {
+        let was = lookup(&installed.environment, key);
+        let now = lookup(&current.environment, key);
+        if was != now {
+            drift.push(Drift::Environment {
+                key: key.to_string(),
+                installed: was,
+                current: now,
+            });
+        }
+    }
+    drift
+}
+
+/// One line a user can act on.
+pub fn describe_drift(drift: &Drift) -> String {
+    match drift {
+        Drift::ExePath { installed, current } => format!(
+            "scheduled binary is {} but this is {}",
+            installed.display(),
+            current.display()
+        ),
+        Drift::Interval { installed, current } => {
+            format!("scheduled every {installed} minutes, expected {current}")
+        }
+        Drift::Environment {
+            key,
+            installed,
+            current,
+        } => {
+            // These values are echoed back to the user and land in pasted bug
+            // reports; a relay URL can carry credentials.
+            let was = installed.as_deref().map(crate::redact::url_userinfo);
+            let now = current.as_deref().map(crate::redact::url_userinfo);
+            match (was, now) {
+                (Some(was), Some(now)) => format!("{key} is {was} in the schedule but {now} here"),
+                (Some(was), None) => format!("{key} is {was} in the schedule but is not set here"),
+                (None, Some(now)) => format!("{key} is {now} here but missing from the schedule"),
+                (None, None) => format!("{key} differs"),
+            }
+        }
+    }
+}
+
+/// Whether the OS reports the schedule as active. Unlike the unit files,
+/// this can only be answered by asking the OS, so it needs a runner.
+pub fn is_activated(platform: Platform, runner: &mut dyn CommandRunner) -> bool {
+    match platform {
+        Platform::Linux => runner
+            .run(
+                "systemctl",
+                &args(&["--user", "is-enabled", "--quiet", SYSTEMD_TIMER]),
+            )
+            .is_ok(),
+        Platform::MacOs => runner
+            .run("launchctl", &args(&["list", LAUNCHD_LABEL]))
+            .is_ok(),
+    }
+}
+
+/// Deactivates and deletes this platform's units. Returns whether anything
+/// was actually removed, so a caller can distinguish "removed" from "there
+/// was nothing there" without treating the latter as an error.
+pub fn uninstall(
+    platform: Platform,
+    home: &Path,
+    xdg_config_home: Option<&Path>,
+    runner: &mut dyn CommandRunner,
+) -> io::Result<bool> {
+    let paths = unit_paths(platform, home, xdg_config_home);
+    if !paths.iter().any(|path| path.exists()) {
+        return Ok(false);
+    }
+
+    // Deactivation is best-effort for the same reason activation is: a
+    // machine with no user session cannot talk to systemd, but the units
+    // should still come off disk.
+    match platform {
+        Platform::Linux => {
+            let _ = runner.run(
+                "systemctl",
+                &args(&["--user", "disable", "--now", SYSTEMD_TIMER]),
+            );
+        }
+        Platform::MacOs => {
+            let _ = runner.run(
+                "launchctl",
+                &args(&["unload", &paths[0].display().to_string()]),
+            );
+        }
+    }
+
+    let mut removed = false;
+    for path in &paths {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]

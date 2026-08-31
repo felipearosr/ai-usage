@@ -26,11 +26,17 @@ pub struct PruneSummary {
     pub quota_snapshots: u64,
     pub sync_outbox: u64,
     pub sync_applied_records: u64,
+    /// Revoked devices retired once their history expired. See [`prune`].
+    pub devices: u64,
 }
 
 impl PruneSummary {
     pub fn total(&self) -> u64 {
-        self.usage_events + self.quota_snapshots + self.sync_outbox + self.sync_applied_records
+        self.usage_events
+            + self.quota_snapshots
+            + self.sync_outbox
+            + self.sync_applied_records
+            + self.devices
     }
 
     pub fn is_empty(&self) -> bool {
@@ -55,6 +61,9 @@ pub fn cutoff(now_epoch: u64) -> String {
 /// re-download of the workspace. The spec's "statistics" and "windows"
 /// record types have no tables yet; when they arrive they belong here.
 ///
+/// Device rows are pruned last, and only under narrow conditions — see
+/// [`prune_devices`].
+///
 /// Outbox rows are pruned by age regardless of delivery state: a row older
 /// than the horizon describes an event that is itself being pruned in the
 /// same pass, so keeping it would queue data the workspace no longer retains.
@@ -62,6 +71,7 @@ pub fn cutoff(now_epoch: u64) -> String {
 /// machine — is left strictly alone.
 pub fn prune(store: &Store, now_epoch: u64) -> Result<PruneSummary> {
     let cutoff = cutoff(now_epoch);
+    let local_device_id = store.get_metadata("device_id")?;
     let tx = store.transaction()?;
 
     let usage_events = tx.execute(
@@ -81,6 +91,10 @@ pub fn prune(store: &Store, now_epoch: u64) -> Result<PruneSummary> {
         rusqlite::params![cutoff],
     )? as u64;
 
+    // Devices go last: whether one still has history depends on the deletes
+    // above having already run in this same transaction.
+    let devices = prune_devices(&tx, &cutoff, local_device_id.as_deref())?;
+
     tx.commit()?;
 
     Ok(PruneSummary {
@@ -88,7 +102,59 @@ pub fn prune(store: &Store, now_epoch: u64) -> Result<PruneSummary> {
         quota_snapshots,
         sync_outbox,
         sync_applied_records,
+        devices,
     })
+}
+
+/// Retires device rows that can no longer be referenced by anything.
+///
+/// Spec §88: "Machine removal revokes sync access but preserves history until
+/// retention expiry." So a revoked device outlives its own removal, and is
+/// only retired once the history it was preserved for is gone.
+///
+/// Three conditions, each load-bearing:
+///
+/// - **Revoked.** A machine that merely went quiet may come back, and would
+///   lose its name and OS if its row were reclaimed underneath it. Only an
+///   explicit removal retires a device.
+/// - **Revoked before the cutoff.** A machine removed yesterday keeps its row
+///   even with no usage, so the fleet table still explains what happened.
+/// - **No remaining events or snapshots.** Reports join usage to devices for
+///   attribution; deleting a device still referenced by in-window history
+///   would both break that and violate the foreign key.
+///
+/// The local device is never retired whatever its state — this machine always
+/// needs its own row. If its id cannot be read at all, no device is pruned:
+/// the exemption failing open would retire the very row it exists to
+/// protect, and skipping a pass costs nothing but a day.
+fn prune_devices(
+    tx: &rusqlite::Transaction<'_>,
+    cutoff: &str,
+    local_device_id: Option<&str>,
+) -> Result<u64> {
+    let Some(local_device_id) = local_device_id else {
+        return Ok(0);
+    };
+    // `device_sources` references `devices`, so it is cleared first.
+    let condition = "
+        revoked_at_utc IS NOT NULL
+        AND revoked_at_utc < ?1
+        AND device_id <> ?2
+        AND device_id NOT IN (SELECT device_id FROM usage_events)
+        AND device_id NOT IN (SELECT observing_device_id FROM quota_snapshots)";
+
+    tx.execute(
+        &format!(
+            "DELETE FROM device_sources
+              WHERE device_id IN (SELECT device_id FROM devices WHERE {condition})"
+        ),
+        rusqlite::params![cutoff, local_device_id],
+    )?;
+    let removed = tx.execute(
+        &format!("DELETE FROM devices WHERE {condition}"),
+        rusqlite::params![cutoff, local_device_id],
+    )?;
+    Ok(removed as u64)
 }
 
 #[cfg(test)]
@@ -113,8 +179,9 @@ mod tests {
             quota_snapshots: 2,
             sync_outbox: 3,
             sync_applied_records: 4,
+            devices: 5,
         };
-        assert_eq!(summary.total(), 10);
+        assert_eq!(summary.total(), 15);
         assert!(!summary.is_empty());
         assert!(PruneSummary::default().is_empty());
     }

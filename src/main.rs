@@ -65,6 +65,26 @@ fn main() {
                 die(1, e);
             }
         }
+        Ok(Command::Status { json }) => {
+            if let Err(e) = run_status(json) {
+                die(1, e);
+            }
+        }
+        Ok(Command::Schedule) => {
+            if let Err(e) = run_schedule_show() {
+                die(1, e);
+            }
+        }
+        Ok(Command::ScheduleInstall) => {
+            if let Err(e) = run_schedule_install() {
+                die(1, e);
+            }
+        }
+        Ok(Command::ScheduleRemove) => {
+            if let Err(e) = run_schedule_remove() {
+                die(1, e);
+            }
+        }
         Ok(Command::Init) => {
             if let Err(e) = run_init() {
                 die(1, e);
@@ -153,6 +173,143 @@ fn run_collect() -> Result<(), Box<dyn std::error::Error>> {
         aiu::utc::now_epoch(),
     )?;
     print!("{}", aiu::pipeline::render(&run));
+    Ok(())
+}
+
+/// Local diagnostics. Every probe is best-effort: an unreachable relay or an
+/// unreadable schedule is a line in the report, never a failed command — the
+/// whole point is to run when something is already wrong.
+fn run_status(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let store = open_store()?;
+    let home = setup_home()?;
+    let report = aiu::report::status::build(
+        &store,
+        probe_schedule(&home),
+        probe_relay(&store),
+        aiu::utc::now_epoch(),
+    )?;
+    if json {
+        print!("{}", aiu::report::status::render_json(&report));
+    } else {
+        print!("{}", aiu::report::status::render_text(&report));
+    }
+    Ok(())
+}
+
+fn probe_schedule(home: &std::path::Path) -> aiu::report::status::ScheduleStatus {
+    use aiu::report::status::ScheduleStatus;
+    let Some(platform) = aiu::scheduler::current_platform() else {
+        return ScheduleStatus::Unsupported;
+    };
+    let xdg = aiu::scheduler::config_home_from_env();
+    let unit_paths = aiu::scheduler::unit_paths(platform, home, xdg.as_deref());
+
+    let Some(installed) = aiu::scheduler::read_installed(platform, home, xdg.as_deref()) else {
+        // Units present but unreadable is not the same as no units: something
+        // is still scheduled, and what it will do is what cannot be read.
+        return if aiu::scheduler::is_installed(platform, home, xdg.as_deref()) {
+            ScheduleStatus::Unreadable { unit_paths }
+        } else {
+            ScheduleStatus::NotInstalled
+        };
+    };
+
+    // With no spec to compare against there is no basis for saying the
+    // schedule is current, so the absence is reported rather than read as
+    // agreement.
+    let drift =
+        aiu::scheduler::current_spec().map(|current| aiu::scheduler::drift(&installed, &current));
+
+    ScheduleStatus::Installed {
+        platform,
+        interval_minutes: installed.spec.interval_minutes,
+        activated: aiu::scheduler::is_activated(platform, &mut aiu::scheduler::ProcessRunner),
+        unit_paths: installed.unit_paths,
+        drift,
+    }
+}
+
+/// Asks the relay for a single record. A machine that has not paired has no
+/// relay to reach, which is reported as such rather than as a failure.
+fn probe_relay(store: &Store) -> aiu::report::status::RelayStatus {
+    use aiu::report::status::RelayStatus;
+    match aiu::setup::is_initialized(store) {
+        Ok(false) => return RelayStatus::NotConfigured,
+        Err(error) => return RelayStatus::Unreachable(error.to_string()),
+        Ok(true) => {}
+    }
+    // Addressing the relay and reaching it are different failures with
+    // different fixes, and a revoked device — the likeliest machine to be
+    // running this command — must not be told the network is down.
+    let config = match aiu::setup::load_sync_config(store, 1) {
+        Ok(config) => config,
+        Err(error) => return RelayStatus::NotAttempted(error.to_string()),
+    };
+    let mut relay = match aiu::relay::HttpRelayClient::from_env() {
+        Ok(relay) => relay,
+        Err(error) => return RelayStatus::NotAttempted(error.to_string()),
+    };
+
+    match aiu::sync::RelayClient::download(
+        &mut relay,
+        &config.device_credential,
+        &config.workspace_id,
+        None,
+        1,
+    ) {
+        Ok(_) => RelayStatus::Reachable,
+        Err(aiu::sync::RelayError::Revoked) => RelayStatus::Revoked,
+        Err(error) => RelayStatus::Unreachable(error.to_string()),
+    }
+}
+
+fn run_schedule_show() -> Result<(), Box<dyn std::error::Error>> {
+    let home = setup_home()?;
+    let schedule = probe_schedule(&home);
+    print!("{}", aiu::report::status::render_schedule(&schedule));
+    // Only the installed case lists its files here; the unreadable line
+    // already names the file it could not read.
+    if let aiu::report::status::ScheduleStatus::Installed { unit_paths, .. } = &schedule {
+        for path in unit_paths {
+            println!("  {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn run_schedule_install() -> Result<(), Box<dyn std::error::Error>> {
+    let home = setup_home()?;
+    match aiu::scheduler::install_default(&home, &mut aiu::scheduler::ProcessRunner) {
+        Some(installed) => {
+            print!("{}", aiu::scheduler::describe(Some(&installed)));
+            println!();
+            for path in &installed.unit_paths {
+                println!("  {}", path.display());
+            }
+            Ok(())
+        }
+        None => Err("no supported scheduler on this OS; run `aiu collect` manually".into()),
+    }
+}
+
+fn run_schedule_remove() -> Result<(), Box<dyn std::error::Error>> {
+    let home = setup_home()?;
+    let Some(platform) = aiu::scheduler::current_platform() else {
+        println!("No supported scheduler on this OS; nothing to remove.");
+        return Ok(());
+    };
+    let xdg = aiu::scheduler::config_home_from_env();
+    let removed = aiu::scheduler::uninstall(
+        platform,
+        &home,
+        xdg.as_deref(),
+        &mut aiu::scheduler::ProcessRunner,
+    )?;
+    if removed {
+        println!("Collection schedule removed. Local data and identity are untouched.");
+    } else {
+        println!("No collection schedule was installed.");
+    }
     Ok(())
 }
 
