@@ -4,9 +4,16 @@
 //!
 //! Timed by running the real `aiu` binary, not by calling `report::build` in
 //! process. "Feels like `git status`" is a claim about what a user waits for,
-//! which includes process start, opening the database, and the quick local
-//! refresh every report command performs before rendering — none of which a
+//! which includes process start and opening the database — neither of which a
 //! library-level measurement would see.
+//!
+//! What these numbers do not include is a working refresh. Report commands go
+//! through `refreshed_store`, which collects and opportunistically syncs
+//! before rendering, but the sandbox `HOME` holds no source files and no
+//! workspace, so both return almost immediately; `aiu status` does not refresh
+//! at all. So this is the query, render and startup cost at retention scale,
+//! which is what the ≲100 ms target is about. Ingest cost is a separate
+//! budget, held by `collect_memory.rs`.
 //!
 //! Its own test binary, like `collect_memory.rs`: a wall-clock budget measured
 //! next to other tests running in parallel measures the harness rather than
