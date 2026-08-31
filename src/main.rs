@@ -243,11 +243,11 @@ fn probe_relay(store: &Store) -> aiu::report::status::RelayStatus {
     // running this command — must not be told the network is down.
     let config = match aiu::setup::load_sync_config(store, 1) {
         Ok(config) => config,
-        Err(error) => return RelayStatus::Misconfigured(error.to_string()),
+        Err(error) => return RelayStatus::NotAttempted(error.to_string()),
     };
     let mut relay = match aiu::relay::HttpRelayClient::from_env() {
         Ok(relay) => relay,
-        Err(error) => return RelayStatus::Misconfigured(error.to_string()),
+        Err(error) => return RelayStatus::NotAttempted(error.to_string()),
     };
 
     match aiu::sync::RelayClient::download(
@@ -267,9 +267,9 @@ fn run_schedule_show() -> Result<(), Box<dyn std::error::Error>> {
     let home = setup_home()?;
     let schedule = probe_schedule(&home);
     print!("{}", aiu::report::status::render_schedule(&schedule));
-    if let aiu::report::status::ScheduleStatus::Installed { unit_paths, .. }
-    | aiu::report::status::ScheduleStatus::Unreadable { unit_paths } = &schedule
-    {
+    // Only the installed case lists its files here; the unreadable line
+    // already names the file it could not read.
+    if let aiu::report::status::ScheduleStatus::Installed { unit_paths, .. } = &schedule {
         for path in unit_paths {
             println!("  {}", path.display());
         }

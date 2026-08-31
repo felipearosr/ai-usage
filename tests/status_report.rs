@@ -388,15 +388,15 @@ fn a_revoked_device_is_told_it_was_revoked_not_that_the_relay_is_down() {
 }
 
 #[test]
-fn a_relay_that_cannot_be_addressed_is_not_reported_as_unreachable() {
+fn a_relay_that_was_never_contacted_is_not_reported_as_unreachable() {
     let store = store_with_device();
     let text = status::render_text(&build(
         &store,
         installed_schedule(),
-        RelayStatus::Misconfigured("invalid relay url".into()),
+        RelayStatus::NotAttempted("invalid relay url".into()),
     ));
 
-    assert!(text.contains("misconfigured"), "{text}");
+    assert!(text.contains("not contacted"), "{text}");
     assert!(text.contains("invalid relay url"), "{text}");
 }
 

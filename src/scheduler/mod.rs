@@ -9,14 +9,14 @@
 //! parameter rather than a `cfg!`, and activation goes through
 //! [`CommandRunner`] rather than spawning `systemctl`/`launchctl` directly.
 
-pub mod units;
+mod units;
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use units::{parse_launchd, parse_systemd};
-// The renderers are part of the scheduler's public surface; the split is an
-// internal organisation of the file-format concern, not an API change.
+// The renderers stay part of the scheduler's public surface; `units` itself
+// is private, so the split adds no new path and really is internal.
 pub use units::{render_launchd_plist, render_systemd_service, render_systemd_timer};
 
 /// The scheduled interval the spec fixes for collection.

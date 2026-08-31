@@ -70,9 +70,10 @@ pub enum RelayStatus {
     /// unreachable relay: the network is fine and the fix is different, and
     /// a revoked machine is among the likeliest to be running `aiu status`.
     Revoked,
-    /// The relay could not be addressed at all — a malformed URL, or local
-    /// configuration that could not be loaded. Not a network problem.
-    Misconfigured(String),
+    /// No request was made at all: the relay address or the local
+    /// configuration could not be loaded. Distinct from `Unreachable`, which
+    /// means a request went out and failed.
+    NotAttempted(String),
     Unreachable(String),
 }
 
@@ -237,8 +238,8 @@ fn relay_line(relay: &RelayStatus) -> String {
         RelayStatus::Revoked => {
             "this machine's access was revoked; re-pair with `aiu join`".to_string()
         }
-        RelayStatus::Misconfigured(why) => {
-            format!("misconfigured ({})", crate::redact::url_userinfo(why))
+        RelayStatus::NotAttempted(why) => {
+            format!("not contacted ({})", crate::redact::url_userinfo(why))
         }
         RelayStatus::Unreachable(why) => {
             format!("unreachable ({})", crate::redact::url_userinfo(why))
@@ -282,8 +283,8 @@ pub fn render_json(report: &StatusReport) -> String {
         RelayStatus::NotConfigured => json!({ "state": "not_configured" }),
         RelayStatus::Reachable => json!({ "state": "reachable" }),
         RelayStatus::Revoked => json!({ "state": "revoked" }),
-        RelayStatus::Misconfigured(why) => json!({
-            "state": "misconfigured",
+        RelayStatus::NotAttempted(why) => json!({
+            "state": "not_attempted",
             "detail": crate::redact::url_userinfo(why),
         }),
         RelayStatus::Unreachable(why) => json!({

@@ -113,3 +113,38 @@ impl scheduler::CommandRunner for NoopRunner {
         Ok(())
     }
 }
+
+/// A hand-edited sub-minute interval is not a schedule aiu can describe.
+/// Truncating it to zero minutes would report drift that misstates what is
+/// actually installed, so the unit reads back as unreadable instead.
+#[test]
+fn a_plist_interval_that_is_not_whole_minutes_is_refused() {
+    for seconds in ["30", "90", "0"] {
+        let root = temp_root(&format!("interval-{seconds}"));
+        write_plist(
+            &root,
+            &format!(
+                "<key>ProgramArguments</key><array><string>/bin/aiu</string></array>\
+                 <key>StartInterval</key><integer>{seconds}</integer>"
+            ),
+        );
+        assert!(
+            scheduler::read_installed(Platform::MacOs, &root, None).is_none(),
+            "{seconds}s is not a whole number of minutes"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn a_whole_minute_plist_interval_is_accepted() {
+    let root = temp_root("interval-ok");
+    write_plist(
+        &root,
+        "<key>ProgramArguments</key><array><string>/bin/aiu</string></array>\
+         <key>StartInterval</key><integer>900</integer>",
+    );
+    let read = scheduler::read_installed(Platform::MacOs, &root, None).unwrap();
+    assert_eq!(read.spec.interval_minutes, 15);
+    let _ = std::fs::remove_dir_all(&root);
+}

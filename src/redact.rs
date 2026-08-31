@@ -7,20 +7,41 @@
 //! reaches a rendering. This is output hygiene, not the privacy hard rule:
 //! nothing here is ever transmitted.
 
-/// Masks the userinfo of any URL in `value`, leaving everything else intact.
+/// Masks the userinfo of every URL in `value`, leaving everything else
+/// intact.
+///
+/// The input is free text — a relay error may name several URLs, or a path
+/// URL before the credentialed one — so every `://` is examined, not just the
+/// first. Within an authority the *last* `@` wins, since a password may
+/// itself contain one, and the authority ends at whitespace or punctuation so
+/// that an `@` in the prose after a URL is never mistaken for its userinfo.
 pub fn url_userinfo(value: &str) -> String {
-    let Some(scheme_end) = value.find("://") else {
-        return value.to_string();
-    };
-    let authority_start = scheme_end + "://".len();
-    let authority = &value[authority_start..];
-    // Userinfo ends at the first `@`, and only counts inside the authority —
-    // an `@` after the path has begun is just part of the path.
-    let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-    let Some(at) = authority[..authority_end].find('@') else {
-        return value.to_string();
-    };
-    format!("{}***@{}", &value[..authority_start], &authority[at + 1..])
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + "://".len();
+        out.push_str(&rest[..authority_start]);
+
+        let authority = &rest[authority_start..];
+        let authority_end = authority.find(is_authority_end).unwrap_or(authority.len());
+        match authority[..authority_end].rfind('@') {
+            Some(at) => {
+                out.push_str("***@");
+                out.push_str(&authority[at + 1..authority_end]);
+            }
+            None => out.push_str(&authority[..authority_end]),
+        }
+        rest = &authority[authority_end..];
+    }
+
+    out.push_str(rest);
+    out
+}
+
+/// Characters that cannot appear in a URL authority, so the first one ends it.
+fn is_authority_end(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '/' | '?' | '#' | ',' | ')' | '"' | '\'' | '<' | '>')
 }
 
 #[cfg(test)]
@@ -47,8 +68,35 @@ mod tests {
         );
     }
 
+    /// A relay error may name a path URL before the credentialed one. Bailing
+    /// at the first `://` let the secret through untouched.
     #[test]
-    fn an_at_sign_in_the_path_is_not_credentials() {
+    fn a_earlier_url_without_an_authority_does_not_stop_the_scan() {
+        assert_eq!(
+            url_userinfo("failed to reach file:///srv/aiu and https://user:tok@relay.example"),
+            "failed to reach file:///srv/aiu and https://***@relay.example"
+        );
+    }
+
+    #[test]
+    fn every_url_in_the_value_is_masked_not_only_the_first() {
+        assert_eq!(
+            url_userinfo("a https://u:p1@h1 and https://u:p2@h2"),
+            "a https://***@h1 and https://***@h2"
+        );
+    }
+
+    /// A password may contain an `@`; the userinfo runs to the *last* one.
+    #[test]
+    fn an_at_sign_inside_the_password_does_not_expose_the_tail() {
+        assert_eq!(
+            url_userinfo("https://user:p@ss@relay.example/v1"),
+            "https://***@relay.example/v1"
+        );
+    }
+
+    #[test]
+    fn an_at_sign_in_the_path_or_prose_is_not_credentials() {
         assert_eq!(
             url_userinfo("https://relay.example/users/@me"),
             "https://relay.example/users/@me"
@@ -56,6 +104,10 @@ mod tests {
         assert_eq!(
             url_userinfo("https://relay.example/?to=a@b"),
             "https://relay.example/?to=a@b"
+        );
+        assert_eq!(
+            url_userinfo("https://relay.example refused, mail a@b"),
+            "https://relay.example refused, mail a@b"
         );
     }
 
@@ -65,8 +117,10 @@ mod tests {
         assert_eq!(url_userinfo(""), "");
     }
 
+    /// Slicing is by byte offset from `find`, which lands on char boundaries;
+    /// multi-byte input must round-trip rather than panic.
     #[test]
-    fn a_multibyte_value_is_handled_by_character_not_byte() {
+    fn multibyte_values_are_preserved() {
         assert_eq!(url_userinfo("/srv/données"), "/srv/données");
         assert_eq!(
             url_userinfo("https://üser:p@relay.example/données"),

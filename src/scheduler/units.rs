@@ -204,6 +204,12 @@ pub(super) fn parse_launchd(plist: &str) -> Option<ParsedUnit> {
         .trim()
         .parse()
         .ok()?;
+    // aiu only ever writes whole minutes. Anything else is hand-edited into a
+    // schedule this cannot describe, and truncating it to 0 minutes would
+    // report a drift that misstates what is actually installed.
+    if interval_seconds == 0 || !interval_seconds.is_multiple_of(60) {
+        return None;
+    }
 
     let environment = match between(plist, "<key>EnvironmentVariables</key>", "</dict>") {
         Some(block) => parse_plist_dict(block),
