@@ -1,5 +1,12 @@
 #!/bin/sh
-# aiu installer — curl -fsSL https://aiu.sh/install | sh
+# aiu installer:
+#
+#   curl -fsSL https://raw.githubusercontent.com/felipearosr/ai-usage/main/install.sh | sh
+#
+# The spec names `https://aiu.sh/install` as the front door. That domain is
+# not registered, so the raw URL above is the working one; if aiu.sh is ever
+# set up it only has to serve this file, since where the script is fetched
+# from has nothing to do with where it downloads artifacts from.
 #
 # Detects OS and architecture, downloads the matching release artifact,
 # verifies it against the release's SHA256SUMS, and installs `aiu` into PATH.
