@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # The spec's ≲100 ms rendering target is asserted only against an
+      # optimized build, so a debug-only run would never enforce it.
+      - run: cargo test --release --test performance
+
+  # The installer is a shell script that runs before aiu exists, so it is
+  # linted separately from the Rust build.
+  installer:
+    name: shellcheck install.sh
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - run: shellcheck --shell=sh install.sh
+
+  # Every target the installer can select must build, or the installer will
+  # happily resolve an artifact that was never produced.
+  targets:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          # Cross-compiled on the Apple Silicon runner: GitHub's Intel macOS
+          # runner is retired, and Apple's toolchain carries both
+          # architectures' SDKs. The binary is built for Intel but never
+          # executed on it in CI.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      # rusqlite is built from bundled C, so a musl target needs a
+      # musl-targeting C compiler, not just the Rust std for musl.
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          # The cc crate reads CC_<triple with underscores>.
+          echo "CC_$(printf %s '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+      - run: cargo build --release --target ${{ matrix.target }}

@@ -1045,7 +1045,7 @@ fn breakdown_without_vendor_snapshot_renders_explicit_gap() {
     event(&store, "g1", "dev-laptop", "go", "opengo-4", 100);
 
     let b = breakdown::build(&store, "go", NOW).unwrap();
-    assert_eq!(b.has_usage, true);
+    assert!(b.has_usage);
     assert_eq!(b.windows.len(), 0);
     let out = breakdown::text::render_models(&b);
     assert!(out.contains("no vendor snapshot yet"), "{out}");

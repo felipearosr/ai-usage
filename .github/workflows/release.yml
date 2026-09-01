@@ -1,0 +1,166 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and publish (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # A tag must not publish a binary nothing ran the tests against.
+  verify:
+    name: fmt, clippy, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      # The release build is the one users get, so the spec's latency target
+      # is enforced against an optimized build here rather than assumed.
+      - run: cargo test --release --test performance
+
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          # Cross-compiled on the Apple Silicon runner: GitHub's Intel macOS
+          # runner is retired, and Apple's toolchain carries both
+          # architectures' SDKs. The binary is built for Intel but never
+          # executed on it in CI.
+          - target: x86_64-apple-darwin
+            os: macos-14
+          - target: aarch64-apple-darwin
+            os: macos-14
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Checked before the build, so a mistyped tag fails in seconds rather
+      # than after four matrix builds.
+      - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          # The tag must be exactly v<version>. Stripping an optional prefix
+          # instead would accept a bare "0.1.0", publish a release named for
+          # it, and leave install.sh asking for download/v0.1.0 — a 404 for
+          # every user.
+          [ "$TAG" = "v$declared" ] \
+            || { echo "tag $TAG must be v$declared (crate version)" >&2; exit 1; }
+          echo "AIU_VERSION=$declared" >> "$GITHUB_ENV"
+
+      - name: Install musl toolchain
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          echo "CC_$(printf %s '${{ matrix.target }}' | tr - _)=musl-gcc" >> "$GITHUB_ENV"
+
+      - run: cargo build --release --target ${{ matrix.target }}
+
+      # The archive holds a bare `aiu` at its root: the installer unpacks it
+      # into a temporary directory and expects exactly that name.
+      - name: Package
+        run: |
+          set -eu
+          mkdir -p dist
+          tar -czf "dist/aiu-$AIU_VERSION-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" aiu
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aiu-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+          merge-multiple: true
+
+      - name: Resolve version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          # The tag must be exactly v<version>. Stripping an optional prefix
+          # instead would accept a bare "0.1.0", publish a release named for
+          # it, and leave install.sh asking for download/v0.1.0 — a 404 for
+          # every user.
+          [ "$TAG" = "v$declared" ] \
+            || { echo "tag $TAG must be v$declared (crate version)" >&2; exit 1; }
+          echo "AIU_VERSION=$declared" >> "$GITHUB_ENV"
+
+      # Checksums are what the installer verifies against, so they are
+      # computed here over the exact bytes being uploaded.
+      - name: Checksums and version marker
+        working-directory: staging
+        run: |
+          set -eu
+          sha256sum *.tar.gz > SHA256SUMS
+          printf '%s\n' "$AIU_VERSION" > VERSION
+          cat SHA256SUMS
+
+      # Every artifact the installer can ask for must exist before the release
+      # is published, or a user on that platform gets a 404 from a tag that
+      # looks complete.
+      - name: Verify the artifact matrix is complete
+        working-directory: staging
+        run: |
+          set -eu
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+                        x86_64-apple-darwin aarch64-apple-darwin; do
+            file="aiu-$AIU_VERSION-$target.tar.gz"
+            [ -f "$file" ] || { echo "missing release artifact: $file" >&2; exit 1; }
+          done
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          # Create only when the release does not exist yet. Swallowing every
+          # `create` failure would hide a real one and upload into nothing.
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi
+          gh release upload "$TAG" staging/* --clobber
